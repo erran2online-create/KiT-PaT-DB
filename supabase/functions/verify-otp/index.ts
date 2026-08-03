@@ -13,9 +13,11 @@ serve(async req=>{
  if(req.method==='OPTIONS') return new Response(null,{status:200,headers:corsHeaders})
  if(req.method!=='POST') return json({error:'Method Not Allowed'},405)
  const sb=createClient(URL!,SERVICE!); const body=await req.json(); const phone=norm(String(body.phone||'')), otp=String(body.otp||''), channel=String(body.channel||'sms'); if(!/^\d{10}$/.test(phone)||!/^\d{6}$/.test(otp)) return json({verified:false,error:'Invalid input'},400)
- const {data:rec}=await sb.from('otp_verification').select('id,otp_hash,expires_at,is_used,attempt_count,max_attempts').eq('phone',phone).eq('channel',channel).eq('is_used',false).gt('expires_at',new Date().toISOString()).order('created_at',{ascending:false}).limit(1).maybeSingle(); if(!rec) return json({verified:false,error:'Code expired or not found'},400)
+ const now=new Date().toISOString()
+ const {data:rec}=await sb.from('otp_verification').select('id,otp_hash,expires_at,is_used,attempt_count,max_attempts').eq('phone',phone).eq('channel',channel).eq('is_used',false).order('created_at',{ascending:false}).limit(1).maybeSingle()
+ if(!rec||rec.expires_at<=now) return json({verified:false,error:'Code expired, please request a new one'},400)
  if(rec.attempt_count>=rec.max_attempts) return json({verified:false,error:'Too many attempts'},429)
- const [salt,stored]=String(rec.otp_hash||'').split(':'); const actual=await sha256(`${salt}:${otp}`); if(!salt||actual!==stored){await sb.from('otp_verification').update({attempt_count:rec.attempt_count+1,last_attempt_at:new Date().toISOString()}).eq('id',rec.id);return json({verified:false,error:'Incorrect code'},400)}
+ const [salt,stored]=String(rec.otp_hash||'').split(':'); const actual=await sha256(`${salt}:${otp}`); if(!salt||actual!==stored){await sb.from('otp_verification').update({attempt_count:rec.attempt_count+1,last_attempt_at:new Date().toISOString()}).eq('id',rec.id);return json({verified:false,error:'Incorrect code, please try again'},400)}
  await sb.from('otp_verification').update({is_used:true,last_attempt_at:new Date().toISOString()}).eq('id',rec.id)
  // Create/fetch public.users via SECURITY DEFINER RPC (anon cannot INSERT users directly)
  const {data:user, error:userErr}=await sb.rpc('ensure_user_after_otp',{p_otp_id:rec.id,p_phone:phone})
