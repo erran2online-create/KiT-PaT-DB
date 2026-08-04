@@ -15,6 +15,9 @@ serve(async req=>{
  const sb=createClient(URL!,SERVICE!); const {phone}=await req.json(); const p=norm(String(phone||'')); if(!/^\d{10}$/.test(p)) return json({error:'Invalid phone'},400)
  const since=new Date(Date.now()-10*60*1000).toISOString(); const {count}=await sb.from('otp_verification').select('id',{count:'exact',head:true}).eq('phone',p).eq('channel','telegram').gte('created_at',since); if((count||0)>=3) return json({error:'Too many requests. Try later.'},429)
  const otp=String(crypto.getRandomValues(new Uint32Array(1))[0]%1000000).padStart(6,'0'), salt=crypto.randomUUID(), hash=await sha256(`${salt}:${otp}`); const message=`🔐 Your KiT-PaT verification code is: ${otp}\n\nValid for 5 minutes. Do not share it.`
+ const expires=new Date(Date.now()+5*60*1000).toISOString()
  const r=await fetch(`https://api.telegram.org/bot${BOT}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:CHAT,text:`${message}\n\nNumber: +91${p}`})}); if(!r.ok) return json({error:'Telegram provider error'},502)
- await sb.from('otp_verification').insert({phone:p,otp_code:null,otp_hash:`${salt}:${hash}`,channel:'telegram',expires_at:new Date(Date.now()+300000).toISOString(),is_used:false,attempt_count:0,max_attempts:5}); return json({success:true,expires_in:300})
+ const {error:insErr}=await sb.from('otp_verification').insert({phone:p,otp_code:null,otp_hash:`${salt}:${hash}`,channel:'telegram',expires_at:expires,is_used:false,attempt_count:0,max_attempts:5})
+ if(insErr) return json({error:'Failed to store OTP',detail:insErr.message},500)
+ return json({success:true,expires_in:300})
 })

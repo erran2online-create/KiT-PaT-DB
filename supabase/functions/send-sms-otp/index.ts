@@ -16,6 +16,7 @@ serve(async req=>{
  const since=new Date(Date.now()-10*60*1000).toISOString(); const {count}=await sb.from('otp_verification').select('id',{count:'exact',head:true}).eq('phone',p).eq('channel','sms').gte('created_at',since); if((count||0)>=3) return json({error:'Too many requests. Try later.'},429)
  const otp=String(crypto.getRandomValues(new Uint32Array(1))[0]%1000000).padStart(6,'0'); const salt=crypto.randomUUID(); const hash=await sha256(`${salt}:${otp}`); const expires=new Date(Date.now()+5*60*1000).toISOString()
  const r=await fetch('https://www.fast2sms.com/dev/bulkV2',{method:'POST',headers:{authorization:FAST2SMS_API_KEY!,'Content-Type':'application/json'},body:JSON.stringify({route:'otp',variables_values:otp,numbers:p})}); if(!r.ok) return json({error:'OTP provider error'},502)
- await sb.from('otp_verification').insert({phone:p,otp_code:null,otp_hash:`${salt}:${hash}`,channel:'sms',expires_at:expires,is_used:false,attempt_count:0,max_attempts:5})
+ const {error:insErr}=await sb.from('otp_verification').insert({phone:p,otp_code:null,otp_hash:`${salt}:${hash}`,channel:'sms',expires_at:expires,is_used:false,attempt_count:0,max_attempts:5})
+ if(insErr) return json({error:'Failed to store OTP',detail:insErr.message},500)
  return json({success:true,expires_in:300})
 })
