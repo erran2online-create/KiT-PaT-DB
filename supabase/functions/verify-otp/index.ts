@@ -63,9 +63,15 @@ serve(async req=>{
  if(req.method==='OPTIONS') return new Response(null,{status:200,headers:corsHeaders})
  if(req.method!=='POST') return json({error:'Method Not Allowed'},405)
  const sb=createClient(URL!,SERVICE!,{auth:{persistSession:false,autoRefreshToken:false}})
- const body=await req.json(); const phone=norm(String(body.phone||'')), otp=String(body.otp||''), channel=String(body.channel||'sms'); if(!/^\d{10}$/.test(phone)||!/^\d{6}$/.test(otp)) return json({verified:false,error:'Invalid input'},400)
+ const body=await req.json(); const phone=norm(String(body.phone||'')), otp=String(body.otp||'')
+ // Only filter by channel when the client explicitly sends one. Defaulting to 'sms'
+ // made Telegram OTPs look "expired" (no sms row) even when a valid telegram row existed.
+ const channelRaw=body.channel; const channel=(channelRaw!=null && String(channelRaw).trim()!=='')?String(channelRaw).trim():null
+ if(!/^\d{10}$/.test(phone)||!/^\d{6}$/.test(otp)) return json({verified:false,error:'Invalid input'},400)
  const now=new Date().toISOString()
- const {data:rec}=await sb.from('otp_verification').select('id,otp_hash,expires_at,is_used,attempt_count,max_attempts').eq('phone',phone).eq('channel',channel).eq('is_used',false).order('created_at',{ascending:false}).limit(1).maybeSingle()
+ let q=sb.from('otp_verification').select('id,otp_hash,expires_at,is_used,attempt_count,max_attempts,channel').eq('phone',phone).eq('is_used',false).order('created_at',{ascending:false}).limit(1)
+ if(channel) q=q.eq('channel',channel)
+ const {data:rec}=await q.maybeSingle()
  if(!rec||rec.expires_at<=now) return json({verified:false,error:'Code expired, please request a new one'},400)
  if(rec.attempt_count>=rec.max_attempts) return json({verified:false,error:'Too many attempts'},429)
  const [salt,stored]=String(rec.otp_hash||'').split(':'); const actual=await sha256(`${salt}:${otp}`); if(!salt||actual!==stored){await sb.from('otp_verification').update({attempt_count:rec.attempt_count+1,last_attempt_at:new Date().toISOString()}).eq('id',rec.id);return json({verified:false,error:'Incorrect code, please try again'},400)}
