@@ -57,26 +57,56 @@ function parseAmountToken(raw: string): number | null {
 }
 
 const TOTAL_LABEL_SRC =
-  String.raw`(?:grand\s*total|amount\s*(?:due|payable)|net\s*(?:amount|payable|total)|balance\s*due|total\s*amount|total\s*due|to\s*pay|\btotal\b)`
+  String.raw`(?:grand\s*total|amount\s*(?:due|payable|paid)|net\s*(?:amount|payable|total)|balance\s*due|total\s*amount|total\s*due|to\s*pay|paid\s*successfully|\bpaid\b|\btotal\b)`
 
 const CURRENCY_PREFIX_SRC = String.raw`(?:rs\.?|inr|₹)\s*`
+const CURRENCY_SUFFIX_SRC = String.raw`\s*(?:rs\.?|inr|₹|rupees?)`
+
+const DATE_PATTERNS: RegExp[] = [
+  /\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b/,
+  /\b(\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2})\b/,
+  /\b(\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{2,4})\b/i,
+  /\b((?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+\d{2,4})\b/i,
+]
+
+/** Lines that usually hold IDs / phones / refs — not bill totals. */
+function looksLikeNonAmountContext(line: string): boolean {
+  return /(?:ref\s*no\.?|reference|order\s*(?:id|no)|txn(?:\s*id)?|transaction|utr|rrn|phone|mobile|gstin?|upi\s*id|account|a\/c|@ok[a-z]|bank\s*-)/i
+    .test(line)
+}
+
+function isReasonableCurrencyAmount(n: number, token: string): boolean {
+  if (n < 1 || n > 1_000_000) return false
+  const digits = token.replace(/,/g, "")
+  // Phone / long order ids
+  if (!digits.includes(".") && digits.length >= 10) return false
+  // Standalone years
+  if (!digits.includes(".") && digits.length === 4 && n >= 1900 && n <= 2099) return false
+  return true
+}
 
 function extractAmountsFromLine(line: string): number[] {
   const out: number[] = []
-  // Labelled: Total: 450 / Grand Total Rs 1,200.00
+  // Labelled: Total: 450 / Amount Paid Rs 1,200.00
   const labelled = new RegExp(
     `${TOTAL_LABEL_SRC}\\s*[:\\-]?\\s*${CURRENCY_PREFIX_SRC}?([\\d,]+(?:\\.\\d{1,2})?)`,
     "gi",
   )
   for (const m of line.matchAll(labelled)) {
     const n = parseAmountToken(m[1])
-    if (n != null) out.push(n)
+    if (n != null && isReasonableCurrencyAmount(n, m[1])) out.push(n)
   }
-  // Bare currency: Rs 450 / ₹1,200.00
-  const currency = new RegExp(`${CURRENCY_PREFIX_SRC}([\\d,]+(?:\\.\\d{1,2})?)`, "gi")
-  for (const m of line.matchAll(currency)) {
+  // Currency before: Rs 450 / ₹1,200.00
+  const currencyBefore = new RegExp(`${CURRENCY_PREFIX_SRC}([\\d,]+(?:\\.\\d{1,2})?)`, "gi")
+  for (const m of line.matchAll(currencyBefore)) {
     const n = parseAmountToken(m[1])
-    if (n != null) out.push(n)
+    if (n != null && isReasonableCurrencyAmount(n, m[1])) out.push(n)
+  }
+  // Currency after: 450 Rs / 115₹ / 336 rupees
+  const currencyAfter = new RegExp(`([\\d,]+(?:\\.\\d{1,2})?)${CURRENCY_SUFFIX_SRC}`, "gi")
+  for (const m of line.matchAll(currencyAfter)) {
+    const n = parseAmountToken(m[1])
+    if (n != null && isReasonableCurrencyAmount(n, m[1])) out.push(n)
   }
   return out
 }
@@ -85,17 +115,67 @@ function lineHasTotalLabel(line: string): boolean {
   return new RegExp(TOTAL_LABEL_SRC, "i").test(line)
 }
 
+function lineHasCurrencyMarker(line: string): boolean {
+  return new RegExp(`(?:${CURRENCY_PREFIX_SRC}|${CURRENCY_SUFFIX_SRC})`, "i").test(line)
+}
+
 function scoreTotalCandidate(line: string, amount: number, lineIndex: number, lineCount: number): number {
   let score = amount / 1e6 // slight preference for larger when tied
   if (/grand\s*total/i.test(line)) score += 100
-  else if (/amount\s*(?:due|payable)/i.test(line)) score += 80
+  else if (/amount\s*(?:due|payable|paid)/i.test(line)) score += 85
   else if (/net\s*(?:amount|payable|total)/i.test(line)) score += 70
-  else if (/balance\s*due|to\s*pay/i.test(line)) score += 60
+  else if (/balance\s*due|to\s*pay|paid\s*successfully/i.test(line)) score += 65
+  else if (/\bpaid\b/i.test(line)) score += 55
   else if (/total/i.test(line)) score += 50
-  else if (new RegExp(CURRENCY_PREFIX_SRC, "i").test(line)) score += 20
+  else if (lineHasCurrencyMarker(line)) score += 20
   // Totals often appear near the bottom of a bill
   score += (lineIndex / Math.max(lineCount - 1, 1)) * 10
   return score
+}
+
+/** Bare numbers that look like money (UPI/Paytm style), excluding dates/phones/refs. */
+function collectBareAmountCandidates(
+  lines: string[],
+): Array<{ amount: number; line: string; score: number }> {
+  const cands: Array<{ amount: number; line: string; score: number }> = []
+  const numRe = /\b(\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?\b/g
+
+  lines.forEach((line, i) => {
+    if (looksLikeNonAmountContext(line)) return
+    // Skip times like 06:02 and slash-dates
+    if (/\d{1,2}:\d{2}/.test(line) && !lineHasCurrencyMarker(line) && !lineHasTotalLabel(line)) {
+      // still allow a standalone amount on a pure-number line checked below
+      if (!/^[\d,]+(?:\.\d{1,2})?$/.test(line)) return
+    }
+
+    const standalone = line.match(/^[\d,]+(?:\.\d{1,2})?$/)
+    if (standalone) {
+      const n = parseAmountToken(standalone[0])
+      if (n != null && isReasonableCurrencyAmount(n, standalone[0])) {
+        // Prefer prominent single-line amounts (common on UPI receipts)
+        let score = 30 + n / 1e6 + (i / Math.max(lines.length - 1, 1)) * 5
+        // Nearby "rupees" / "paid" lines boost confidence of the guess
+        const nearby = [lines[i - 1], lines[i + 1], lines[i + 2]].filter(Boolean).join(" ")
+        if (/rupees?|paid|amount/i.test(nearby)) score += 25
+        cands.push({ amount: n, line, score })
+      }
+      return
+    }
+
+    for (const m of line.matchAll(numRe)) {
+      // Skip tokens that are part of a date-looking substring
+      const idx = m.index ?? 0
+      const window = line.slice(Math.max(0, idx - 8), idx + m[0].length + 8)
+      if (DATE_PATTERNS.some((re) => re.test(window))) continue
+      if (/\d:\d/.test(window)) continue // time fragments
+      const n = parseAmountToken(m[0])
+      if (n == null || !isReasonableCurrencyAmount(n, m[0])) continue
+      let score = 10 + n / 1e6 + (i / Math.max(lines.length - 1, 1)) * 5
+      if (/rupees?|paid|amount/i.test(line)) score += 15
+      cands.push({ amount: n, line, score })
+    }
+  })
+  return cands
 }
 
 function parseTotalAmount(rawText: string): Field<number> {
@@ -104,54 +184,65 @@ function parseTotalAmount(rawText: string): Field<number> {
   const cands: Cand[] = []
   const seen = new Set<string>()
 
+  const push = (amount: number, line: string, score: number, key: string) => {
+    if (seen.has(key)) return
+    seen.add(key)
+    cands.push({ amount, line, score })
+  }
+
   lines.forEach((line, i) => {
+    if (looksLikeNonAmountContext(line)) return
     const amounts = extractAmountsFromLine(line)
-    // Also: next-line amount after a total label
-    if (lineHasTotalLabel(line) && amounts.length === 0 && i + 1 < lines.length) {
-      const nextAmts = extractAmountsFromLine(lines[i + 1])
-      const bare = lines[i + 1].match(/^[\d,]+(?:\.\d{1,2})?$/)
-      if (bare) {
-        const n = parseAmountToken(bare[0])
-        if (n != null) nextAmts.push(n)
-      }
-      for (const a of nextAmts) {
-        const key = `${a}@${i}`
-        if (seen.has(key)) continue
-        seen.add(key)
-        cands.push({ amount: a, line, score: scoreTotalCandidate(line, a, i, lines.length) })
+    // Next-line amount after a total / paid label (common OCR split)
+    if (lineHasTotalLabel(line) && amounts.length === 0) {
+      for (const j of [i + 1, i - 1]) {
+        if (j < 0 || j >= lines.length) continue
+        if (looksLikeNonAmountContext(lines[j])) continue
+        const nextAmts = extractAmountsFromLine(lines[j])
+        const bare = lines[j].match(/^[\d,]+(?:\.\d{1,2})?$/)
+        if (bare) {
+          const n = parseAmountToken(bare[0])
+          if (n != null && isReasonableCurrencyAmount(n, bare[0])) nextAmts.push(n)
+        }
+        for (const a of nextAmts) {
+          push(a, line, scoreTotalCandidate(line, a, i, lines.length) + 15, `${a}@label@${i}@${j}`)
+        }
       }
     }
     for (const a of amounts) {
-      const key = `${a}@${i}`
-      if (seen.has(key)) continue
-      seen.add(key)
-      cands.push({ amount: a, line, score: scoreTotalCandidate(line, a, i, lines.length) })
+      push(a, line, scoreTotalCandidate(line, a, i, lines.length), `${a}@${i}`)
     }
   })
 
-  // Prefer labelled totals; if none, fall back to currency amounts
+  // Prefer labelled totals; then currency-marked; then bare-number fallback (low confidence)
   const labelled = cands.filter((c) => lineHasTotalLabel(c.line))
-  const pool = labelled.length > 0
-    ? labelled
-    : cands.filter((c) => new RegExp(CURRENCY_PREFIX_SRC, "i").test(c.line))
-  if (pool.length === 0) return { value: null, confidence: "unclear" }
+  const currencyMarked = cands.filter((c) => lineHasCurrencyMarker(c.line))
+  let pool = labelled.length > 0 ? labelled : currencyMarked
+  let confidence: Confidence = "high"
+
+  if (pool.length === 0) {
+    const bare = collectBareAmountCandidates(lines)
+    if (bare.length === 0) return { value: null, confidence: "unclear" }
+    pool = bare
+    confidence = "low"
+  } else {
+    const uniqueAmounts = new Set(pool.map((c) => c.amount))
+    if (uniqueAmounts.size > 1) confidence = "low"
+  }
 
   pool.sort((a, b) => b.score - a.score)
-  const best = pool[0]
-  const uniqueAmounts = new Set(pool.map((c) => c.amount))
-  if (uniqueAmounts.size === 1 && (labelled.length === 1 || pool.length === 1)) {
-    return { value: best.amount, confidence: "high" }
+  // Bare fallback: take the highest-scoring candidate (largest + context boosts)
+  if (confidence === "low" && labelled.length === 0 && currencyMarked.length === 0) {
+    pool.sort((a, b) => b.score - a.score || b.amount - a.amount)
   }
+  const best = pool[0]
+  if (labelled.length === 0 && currencyMarked.length === 0) {
+    return { value: best.amount, confidence: "low" }
+  }
+  const uniqueAmounts = new Set(pool.map((c) => c.amount))
   if (uniqueAmounts.size === 1) return { value: best.amount, confidence: "high" }
   return { value: best.amount, confidence: "low" }
 }
-
-const DATE_PATTERNS: RegExp[] = [
-  /\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b/,
-  /\b(\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2})\b/,
-  /\b(\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{2,4})\b/i,
-  /\b((?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2},?\s+\d{2,4})\b/i,
-]
 
 function parseDate(rawText: string): Field<string> {
   const hits: string[] = []
