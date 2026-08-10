@@ -1,0 +1,287 @@
+{
+  "name": "KiT-PaT Event Reminder 24h",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "cron-24h",
+      "name": "Every hour",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.SUPABASE_URL}}/rest/v1/rpc/n8n_events_due_in_24h",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{$env.SUPABASE_SERVICE_ROLE_KEY}}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.SUPABASE_SERVICE_ROLE_KEY}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{}",
+        "options": {}
+      },
+      "id": "fetch-events",
+      "name": "Fetch events due in 24h",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        260,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json;\nconst rows = Array.isArray(raw) ? raw : (Array.isArray(raw?.data) ? raw.data : [raw]);\nconst out = [];\nfor (const ev of rows) {\n  if (!ev || !ev.id) continue;\n  out.push({ json: ev });\n}\nif (out.length === 0) {\n  return [{ json: { skip: true, reason: 'no events in 24h window' } }];\n}\nreturn out;"
+      },
+      "id": "split-events",
+      "name": "Split events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.skip}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "if-skip",
+      "name": "Skip empty",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        740,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{$env.SUPABASE_URL}}/rest/v1/reminder_templates",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "timing",
+              "value": "eq.24h"
+            },
+            {
+              "name": "tone",
+              "value": "eq.sweet"
+            },
+            {
+              "name": "select",
+              "value": "template_text"
+            },
+            {
+              "name": "limit",
+              "value": "1"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{$env.SUPABASE_SERVICE_ROLE_KEY}}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.SUPABASE_SERVICE_ROLE_KEY}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "load-template",
+      "name": "Load 24h template",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        980,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const ev = $('Split events').item.json;\nif (ev.skip) return [];\nconst tmplRows = $('Load 24h template').all().map(i => i.json);\nconst first = tmplRows[0];\nconst tmpl = (Array.isArray(first) ? first[0] : first)?.template_text\n  || 'Reminder: {title} is tomorrow at {venue}. See you there!';\nconst title = ev.title || ev.theme || 'your party';\nconst venue = ev.venue || 'TBD';\nconst amount = ev.contribution_amount ?? '';\nconst when = ev.party_date || '';\nlet text = tmpl\n  .replaceAll('{group_name}', ev.group_name || 'your group')\n  .replaceAll('{title}', title)\n  .replaceAll('{venue}', venue)\n  .replaceAll('{amount}', String(amount))\n  .replaceAll('{time}', when)\n  .replaceAll('{date}', when)\n  .replaceAll('{theme}', ev.theme || '')\n  .replaceAll('{host_name}', 'your host');\ntext += `\\n\\nRSVPs going/maybe: ${ev.rsvp_going_maybe ?? 0}`;\ntext += `\\nParty: ${title}`;\ntext += '\\n\\n(KiT-PaT 24h reminder \u2014 digest to support chat until member telegram_id is linked)';\nreturn [{ json: { text, event_id: ev.id } }];"
+      },
+      "id": "build-message",
+      "name": "Build Telegram message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1220,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.SUPABASE_URL}}/functions/v1/send-telegram",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{$env.SUPABASE_SERVICE_ROLE_KEY}}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.SUPABASE_SERVICE_ROLE_KEY}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.text }) }}",
+        "options": {}
+      },
+      "id": "telegram-send",
+      "name": "Send Telegram",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1460,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: { ok: true, skipped: true } }];"
+      },
+      "id": "noop-skip",
+      "name": "No events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        980,
+        120
+      ]
+    }
+  ],
+  "connections": {
+    "Every hour": {
+      "main": [
+        [
+          {
+            "node": "Fetch events due in 24h",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch events due in 24h": {
+      "main": [
+        [
+          {
+            "node": "Split events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split events": {
+      "main": [
+        [
+          {
+            "node": "Skip empty",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip empty": {
+      "main": [
+        [
+          {
+            "node": "No events",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Load 24h template",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load 24h template": {
+      "main": [
+        [
+          {
+            "node": "Build Telegram message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Telegram message": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": true,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "id": "cd5a7941-0953-417e-962d-c334230a293c",
+  "versionId": "9e67c21b-7b3d-4624-af7b-434a3d4a4ac0"
+}

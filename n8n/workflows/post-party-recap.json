@@ -1,0 +1,273 @@
+{
+  "name": "KiT-PaT Post-Party Recap",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "cron-recap",
+      "name": "Every 30 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.SUPABASE_URL}}/rest/v1/rpc/n8n_events_needing_recap",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{$env.SUPABASE_SERVICE_ROLE_KEY}}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.SUPABASE_SERVICE_ROLE_KEY}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{}",
+        "options": {}
+      },
+      "id": "fetch-completed",
+      "name": "Fetch completed needing recap",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        260,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json;\nconst rows = Array.isArray(raw) ? raw : (Array.isArray(raw?.data) ? raw.data : [raw]);\nconst out = [];\nfor (const ev of rows) {\n  if (!ev || !ev.id) continue;\n  out.push({ json: ev });\n}\nif (out.length === 0) {\n  return [{ json: { skip: true, reason: 'no completed events needing recap' } }];\n}\nreturn out;"
+      },
+      "id": "split-completed",
+      "name": "Split completed events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.skip}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "if-skip-recap",
+      "name": "Skip empty",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        740,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.SUPABASE_URL}}/rest/v1/rpc/generate_party_recap",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{$env.SUPABASE_SERVICE_ROLE_KEY}}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.SUPABASE_SERVICE_ROLE_KEY}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ p_event_id: $json.id }) }}",
+        "options": {}
+      },
+      "id": "generate-recap",
+      "name": "Generate party recap",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        980,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const ev = $('Split completed events').item.json;\nconst recapResp = $input.first().json;\nconst recap = recapResp.recap || recapResp;\nconst attendance = recap.attendance_count ?? recap?.recap?.attendance_count ?? '?';\nconst winners = recap.winners || recap?.recap?.winners || [];\nconst winnerLine = Array.isArray(winners) && winners.length\n  ? winners.slice(0, 3).map(w => w.prize_name || w.user_name || 'winner').join(', ')\n  : 'no verified winners yet';\nconst title = ev.title || 'your party';\nconst text = [\n  `\ud83c\udf89 Party recap ready: ${title}`,\n  `Group: ${ev.group_name || 'your group'}`,\n  `Attendance: ${attendance}`,\n  `Winners: ${winnerLine}`,\n  '',\n  'Open KiT-PaT Memories for the full recap.',\n  '(KiT-PaT post-party ping \u2014 digest to support chat until group telegram_group_id is linked)'\n].join('\\n');\nreturn [{ json: { text, event_id: ev.id, artifact_id: recapResp.artifact_id || null } }];"
+      },
+      "id": "build-recap-msg",
+      "name": "Build recap Telegram",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1220,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.SUPABASE_URL}}/functions/v1/send-telegram",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{$env.SUPABASE_SERVICE_ROLE_KEY}}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.SUPABASE_SERVICE_ROLE_KEY}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.text }) }}",
+        "options": {}
+      },
+      "id": "telegram-recap",
+      "name": "Send Telegram",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1460,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: { ok: true, skipped: true } }];"
+      },
+      "id": "noop-skip-recap",
+      "name": "No events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        980,
+        120
+      ]
+    }
+  ],
+  "connections": {
+    "Every 30 minutes": {
+      "main": [
+        [
+          {
+            "node": "Fetch completed needing recap",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch completed needing recap": {
+      "main": [
+        [
+          {
+            "node": "Split completed events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split completed events": {
+      "main": [
+        [
+          {
+            "node": "Skip empty",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip empty": {
+      "main": [
+        [
+          {
+            "node": "No events",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Generate party recap",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate party recap": {
+      "main": [
+        [
+          {
+            "node": "Build recap Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build recap Telegram": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": true,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "id": "1ee20116-1f93-4fd7-a5a0-ddfc92b79ac7",
+  "versionId": "9cad1473-b4d1-48e3-9aaa-20fe1bca05b2"
+}
