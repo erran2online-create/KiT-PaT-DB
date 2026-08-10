@@ -188,6 +188,41 @@
     },
     {
       "parameters": {
+        "method": "POST",
+        "url": "={{$env.SUPABASE_URL}}/rest/v1/rpc/n8n_mark_reminder_sent",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "={{$env.SUPABASE_SERVICE_ROLE_KEY}}"
+            },
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.SUPABASE_SERVICE_ROLE_KEY}}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ p_event_id: $('Build Telegram message').item.json.event_id, p_timing: '24h' }) }}",
+        "options": {}
+      },
+      "id": "mark-sent",
+      "name": "Mark reminder sent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1700,
+        -100
+      ]
+    },
+    {
+      "parameters": {
         "jsCode": "return [{ json: { ok: true, skipped: true } }];"
       },
       "id": "noop-skip",
@@ -273,6 +308,17 @@
           }
         ]
       ]
+    },
+    "Send Telegram": {
+      "main": [
+        [
+          {
+            "node": "Mark reminder sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
   "settings": {
@@ -282,6 +328,6 @@
   "meta": {
     "templateCredsSetupCompleted": true
   },
-  "id": "cd5a7941-0953-417e-962d-c334230a293c",
-  "versionId": "9e67c21b-7b3d-4624-af7b-434a3d4a4ac0"
+  "id": "f3a171ad-f9a2-4c95-b2a4-82ccc9813d26",
+  "versionId": "48ab184f-4747-4729-87f3-dd884966e1e4"
 }
