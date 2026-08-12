@@ -1,19 +1,27 @@
-# n8n on Railway (P12)
+# n8n on Railway (P12 / P15)
 
 ## Live instance
 
 - Project: [KiT-PaT](https://railway.com/project/7e675fde-0d77-48d6-9644-2baefc91000a)
 - Editor: https://n8n-production-69dd.up.railway.app
-- Owner: `erran2online@gmail.com` (password was set during setup — reset via n8n UI if needed)
+
+## Diagnosis — repeated 24h reminders (P12.2 / P15)
+
+`sent_reminders` + `n8n_events_due_in_24h` were correct in Postgres, and the
+**draft/published workflow JSON** included `Mark reminder sent`. But after
+`n8n import` / `publish`, the running process was **not restarted**, so the
+hourly cron kept the **old no-mark workflow** (n8n warns: “Changes will not
+take effect if n8n is running”). That re-sent every hour while the party
+stayed in the 24h window. Always restart/redeploy n8n after publishing.
 
 ## Workflows
 
-Imported from this folder:
-
-1. **KiT-PaT Event Reminder 24h** — hourly cron → `n8n_events_due_in_24h` → `reminder_templates` (24h) → `send-telegram` → `n8n_mark_reminder_sent` (once per event via `sent_reminders`)
-2. **KiT-PaT Post-Party Recap** — every 30m → `n8n_events_needing_recap` → `generate_party_recap` → `send-telegram`
-
-Telegram digests go to `KITPAT_SUPPORT_CHAT_ID` until `users.telegram_id` / `groups.telegram_group_id` are linked.
+1. **KiT-PaT User Reminder Digest** (P15) — hourly → `get_users_due_for_reminder`
+   → Telegram → `n8n_mark_user_reminder_sent`. Respects per-user frequency
+   (`once_daily` / `twice_daily` / `thrice_daily` / `hourly`) and active
+   window (default 06:00–21:00 local).
+2. Legacy **Event Reminder 24h** / **Post-Party Recap** — recap still useful;
+   deactivate the old 24h event workflow once the user digest is live.
 
 ## Required Railway env (n8n service)
 
@@ -21,17 +29,18 @@ Telegram digests go to `KITPAT_SUPPORT_CHAT_ID` until `users.telegram_id` / `gro
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `WEBHOOK_URL` / `N8N_WEBHOOK_URL`
 - `N8N_ENCRYPTION_KEY` (stable across deploys)
-- `N8N_BLOCK_ENV_ACCESS_IN_NODE=false` — required for `$env.*` in HTTP nodes (community plan has no Variables). Without this, nodes fail with "access to env vars denied" / Invalid URL.
+- `N8N_BLOCK_ENV_ACCESS_IN_NODE=false` — required for `$env.*` in HTTP nodes
 
 ## Persistence caveat
 
-SQLite under `/home/node/.n8n` is ephemeral unless a writable volume or Postgres is wired.
-Attaching a volume at `/home/node/.n8n` fails with `EACCES` because the official image runs as `node` and cannot `chown` the mount.
-Until Postgres (with a real role) or a root-capable entrypoint is fixed, **avoid Railway redeploys** or re-import these workflows after boot.
+SQLite under `/home/node/.n8n` is ephemeral unless a writable volume or
+Postgres is wired. After any redeploy: re-import workflows, publish, **and
+restart** the n8n service.
 
 ## Supabase helpers
 
-- RPC `n8n_events_due_in_24h()` — skips events already in `sent_reminders` with `timing=24h`
-- RPC `n8n_mark_reminder_sent(p_event_id, p_timing)` — records send (idempotent)
-- RPC `n8n_events_needing_recap()`
-- Edge `send-telegram` (service_role only) — Bot API style, same secrets as `send-telegram-otp`
+- `user_reminder_preferences` / `user_reminder_sends`
+- `get_users_due_for_reminder(p_now)` — optional `p_now` for tests
+- `n8n_mark_user_reminder_sent(user_id, slot_index, p_now)`
+- Legacy: `n8n_events_due_in_24h`, `n8n_mark_reminder_sent`, `n8n_events_needing_recap`
+- Edge `send-telegram` (service_role only)

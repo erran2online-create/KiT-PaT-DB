@@ -1,5 +1,5 @@
 {
-  "name": "KiT-PaT Event Reminder 24h",
+  "name": "KiT-PaT User Reminder Digest",
   "nodes": [
     {
       "parameters": {
@@ -12,7 +12,7 @@
           ]
         }
       },
-      "id": "cron-24h",
+      "id": "cron-hourly",
       "name": "Every hour",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
@@ -24,7 +24,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "={{$env.SUPABASE_URL}}/rest/v1/rpc/n8n_events_due_in_24h",
+        "url": "={{$env.SUPABASE_URL}}/rest/v1/rpc/get_users_due_for_reminder",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -47,8 +47,8 @@
         "jsonBody": "{}",
         "options": {}
       },
-      "id": "fetch-events",
-      "name": "Fetch events due in 24h",
+      "id": "fetch-due-users",
+      "name": "Fetch users due",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
@@ -58,10 +58,10 @@
     },
     {
       "parameters": {
-        "jsCode": "const raw = $input.first().json;\nconst rows = Array.isArray(raw) ? raw : (Array.isArray(raw?.data) ? raw.data : [raw]);\nconst out = [];\nfor (const ev of rows) {\n  if (!ev || !ev.id) continue;\n  out.push({ json: ev });\n}\nif (out.length === 0) {\n  return [{ json: { skip: true, reason: 'no events in 24h window' } }];\n}\nreturn out;"
+        "jsCode": "const raw = $input.first().json;\nconst rows = Array.isArray(raw) ? raw : (Array.isArray(raw?.data) ? raw.data : [raw]);\nconst out = [];\nfor (const u of rows) {\n  if (!u || !u.user_id) continue;\n  out.push({ json: u });\n}\nif (out.length === 0) {\n  return [{ json: { skip: true, reason: 'no users due' } }];\n}\nreturn out;"
       },
-      "id": "split-events",
-      "name": "Split events",
+      "id": "split-users",
+      "name": "Split users",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
@@ -91,63 +91,27 @@
     },
     {
       "parameters": {
-        "method": "GET",
-        "url": "={{$env.SUPABASE_URL}}/rest/v1/reminder_templates",
-        "sendQuery": true,
-        "queryParameters": {
-          "parameters": [
-            {
-              "name": "timing",
-              "value": "eq.24h"
-            },
-            {
-              "name": "tone",
-              "value": "eq.sweet"
-            },
-            {
-              "name": "select",
-              "value": "template_text"
-            },
-            {
-              "name": "limit",
-              "value": "1"
-            }
-          ]
-        },
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "apikey",
-              "value": "={{$env.SUPABASE_SERVICE_ROLE_KEY}}"
-            },
-            {
-              "name": "Authorization",
-              "value": "=Bearer {{$env.SUPABASE_SERVICE_ROLE_KEY}}"
-            }
-          ]
-        },
-        "options": {}
+        "jsCode": "return [{ json: { ok: true, skipped: true } }];"
       },
-      "id": "load-template",
-      "name": "Load 24h template",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
+      "id": "noop-skip",
+      "name": "No users",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [
         980,
-        -100
+        120
       ]
     },
     {
       "parameters": {
-        "jsCode": "const ev = $('Split events').item.json;\nif (ev.skip) return [];\nconst tmplRows = $('Load 24h template').all().map(i => i.json);\nconst first = tmplRows[0];\nconst tmpl = (Array.isArray(first) ? first[0] : first)?.template_text\n  || 'Reminder: {title} is tomorrow at {venue}. See you there!';\nconst title = ev.title || ev.theme || 'your party';\nconst venue = ev.venue || 'TBD';\nconst amount = ev.contribution_amount ?? '';\nconst when = ev.party_date || '';\nlet text = tmpl\n  .replaceAll('{group_name}', ev.group_name || 'your group')\n  .replaceAll('{title}', title)\n  .replaceAll('{venue}', venue)\n  .replaceAll('{amount}', String(amount))\n  .replaceAll('{time}', when)\n  .replaceAll('{date}', when)\n  .replaceAll('{theme}', ev.theme || '')\n  .replaceAll('{host_name}', 'your host');\ntext += `\\n\\nRSVPs going/maybe: ${ev.rsvp_going_maybe ?? 0}`;\ntext += `\\nParty: ${title}`;\ntext += '\\n\\n(KiT-PaT 24h reminder \u2014 digest to support chat until member telegram_id is linked)';\nreturn [{ json: { text, event_id: ev.id } }];"
+        "jsCode": "const u = $json;\nconst when = u.upcoming_party_date || '';\nconst title = u.upcoming_event_title || 'your party';\nconst group = u.group_name || 'your group';\nconst name = u.user_name || 'there';\nconst text = [\n  `Hi ${name} \u2014 reminder from KiT-PaT`,\n  `Party: ${title}`,\n  `Group: ${group}`,\n  `When: ${when}`,\n  `Frequency: ${u.frequency} (slot ${u.slot_index}/${u.slots_today})`,\n  '',\n  '(Digest \u2014 DMs use telegram_id when linked; otherwise support chat.)'\n].join('\\n');\nreturn [{ json: {\n  text,\n  user_id: u.user_id,\n  slot_index: u.slot_index,\n  chat_id: u.telegram_id || null\n} }];"
       },
-      "id": "build-message",
+      "id": "build-msg",
       "name": "Build Telegram message",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1220,
+        980,
         -100
       ]
     },
@@ -174,7 +138,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ text: $json.text }) }}",
+        "jsonBody": "={{ JSON.stringify($json.chat_id ? { text: $json.text, chat_id: $json.chat_id } : { text: $json.text }) }}",
         "options": {}
       },
       "id": "telegram-send",
@@ -182,14 +146,14 @@
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        1460,
+        1220,
         -100
       ]
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "={{$env.SUPABASE_URL}}/rest/v1/rpc/n8n_mark_reminder_sent",
+        "url": "={{$env.SUPABASE_URL}}/rest/v1/rpc/n8n_mark_user_reminder_sent",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -209,29 +173,16 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ p_event_id: $('Build Telegram message').item.json.event_id, p_timing: '24h' }) }}",
+        "jsonBody": "={{ JSON.stringify({ p_user_id: $('Build Telegram message').item.json.user_id, p_slot_index: $('Build Telegram message').item.json.slot_index }) }}",
         "options": {}
       },
       "id": "mark-sent",
-      "name": "Mark reminder sent",
+      "name": "Mark user reminder sent",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        1700,
+        1460,
         -100
-      ]
-    },
-    {
-      "parameters": {
-        "jsCode": "return [{ json: { ok: true, skipped: true } }];"
-      },
-      "id": "noop-skip",
-      "name": "No events",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        980,
-        120
       ]
     }
   ],
@@ -240,25 +191,25 @@
       "main": [
         [
           {
-            "node": "Fetch events due in 24h",
+            "node": "Fetch users due",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Fetch events due in 24h": {
+    "Fetch users due": {
       "main": [
         [
           {
-            "node": "Split events",
+            "node": "Split users",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Split events": {
+    "Split users": {
       "main": [
         [
           {
@@ -273,22 +224,11 @@
       "main": [
         [
           {
-            "node": "No events",
+            "node": "No users",
             "type": "main",
             "index": 0
           }
         ],
-        [
-          {
-            "node": "Load 24h template",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Load 24h template": {
-      "main": [
         [
           {
             "node": "Build Telegram message",
@@ -313,7 +253,7 @@
       "main": [
         [
           {
-            "node": "Mark reminder sent",
+            "node": "Mark user reminder sent",
             "type": "main",
             "index": 0
           }
@@ -324,10 +264,10 @@
   "settings": {
     "executionOrder": "v1"
   },
-  "active": false,
+  "active": true,
   "meta": {
     "templateCredsSetupCompleted": true
   },
-  "id": "f3a171ad-f9a2-4c95-b2a4-82ccc9813d26",
-  "versionId": "48ab184f-4747-4729-87f3-dd884966e1e4"
+  "id": "fc3a72c6-6844-4047-b406-c76b7af3fbaa",
+  "versionId": "cc5d30d9-8461-4029-a14f-ff7b26029f76"
 }
