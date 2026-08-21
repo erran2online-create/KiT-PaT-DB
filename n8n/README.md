@@ -2,8 +2,7 @@
 
 ## Live instance
 
-- Project: [KiT-PaT](https://railway.com/project/7e675fde-0d77-48d6-9644-2baefc91000a)
-- Editor: https://n8n-production-69dd.up.railway.app
+Live instance URLs are in Railway — not published here.
 
 ## Diagnosis — repeated 24h reminders (P12.2 / P15)
 
