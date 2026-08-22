@@ -10,8 +10,8 @@
 - service_role never leaves the server. Never in a VITE_ variable.
 - Money totals: return 0 plus a separate flag. Never null, never a bare error.
 - Raise stable error codes (KITPAT_*), never English strings the frontend regexes.
-- Nothing is "done" without live verification: a query, a curl, or a test run,
-  with the real output pasted back. Prior sessions reported work as complete
+- Nothing is "done" until it is verified outside this session against the live
+  database. Report what you wrote; never assert that it works.Prior sessions reported work as complete
   that was never built. Assume nothing.
 - If a column, table or RPC you need does not exist, STOP and report it.
   Do not invent one.
