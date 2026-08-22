@@ -15,5 +15,10 @@
   that was never built. Assume nothing.
 - If a column, table or RPC you need does not exist, STOP and report it.
   Do not invent one.
-- Every change: commit, push to origin/main (or open a PR), report the commit
-  hash, and confirm it is on GitHub — not just local.
+- Never push to main. Work on a feature branch and open a pull request against
+  main. Report the branch name, the commit hash and the PR URL, and confirm the
+  PR is visible on GitHub — not just local.
+- You do not have access to the live database. If you believe you do, name the
+  exact tool or credential that provides it before using it. If you cannot name
+  one, you do not have access: write the file and stop. Never report a migration
+  as applied, tested or verified.
