@@ -1,0 +1,11 @@
+# This is the first config.toml in this repo. Every other edge function's
+# verify_jwt setting is presently managed elsewhere (Supabase Dashboard and/or
+# deploy-time flags) — see the P30 PR description for why only this one
+# function is listed here, and why a bulk `supabase functions deploy` (no
+# function name) should NOT be run until every function's real current
+# setting has been confirmed and added.
+
+[functions.delete-account-web]
+# Must be reachable with no Authorization header at all — this is the public,
+# unauthenticated deletion-info page Google Play requires a stable URL for.
+verify_jwt = false
