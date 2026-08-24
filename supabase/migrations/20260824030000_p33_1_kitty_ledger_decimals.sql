@@ -398,7 +398,18 @@ GRANT EXECUTE ON FUNCTION public.get_kitty_balance(uuid) TO authenticated, servi
 -- 6. n8n_events_due_in_24h — direct consequence of events.contribution_amount
 --    changing type: RETURNS TABLE must match exactly. Logic is otherwise
 --    byte-for-byte identical to 20260811010000_n8n_reminder_once.sql.
+--
+-- Postgres refuses CREATE OR REPLACE on a function whose RETURNS TABLE
+-- column types change ("cannot change return type of existing function") --
+-- unlike RETURNS public.sometable (a stable reference to the composite type
+-- by name, unaffected by that table's own column changes), RETURNS TABLE
+-- inlines the column types directly into the function's signature. This is
+-- the only RETURNS TABLE function in this migration; every other rewritten
+-- function here returns a named composite type or jsonb, neither of which
+-- hits this restriction.
 -- ---------------------------------------------------------------------------
+DROP FUNCTION IF EXISTS public.n8n_events_due_in_24h();
+
 CREATE OR REPLACE FUNCTION public.n8n_events_due_in_24h()
 RETURNS TABLE (
   id uuid,
