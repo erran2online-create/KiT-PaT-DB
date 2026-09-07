@@ -53,6 +53,10 @@ const PK_COLUMN: Record<string, string> = {
   festival_themes: "id",
   greeting_variants: "id",
   tambola_variants: "key",
+  festival_cards: "id",
+  promo_cards: "id",
+  coupons: "id",
+  coupon_targets: "id",
 }
 const ALLOWED_TABLES = Object.keys(PK_COLUMN)
 const ALLOWED_OPS = ["insert", "update", "delete"] as const
