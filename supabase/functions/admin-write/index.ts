@@ -57,6 +57,7 @@ const PK_COLUMN: Record<string, string> = {
   promo_cards: "id",
   coupons: "id",
   coupon_targets: "id",
+  app_content: "id",
 }
 const ALLOWED_TABLES = Object.keys(PK_COLUMN)
 const ALLOWED_OPS = ["insert", "update", "delete"] as const
