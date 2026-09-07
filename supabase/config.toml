@@ -18,3 +18,12 @@ verify_jwt = false
 # email before allowing any write. Deploy by name only:
 #   supabase functions deploy admin-write
 verify_jwt = true
+
+[functions.admin-reveal]
+# Requires a valid Supabase Auth JWT (platform-level, same as admin-write).
+# The function re-derives the caller's identity from that JWT and further
+# requires an ACTIVE public.admins row with role='owner' before allowing a
+# reveal request or confirmation; admin_request_reveal/admin_confirm_reveal
+# independently re-check ownership server-side. Deploy by name only:
+#   supabase functions deploy admin-reveal
+verify_jwt = true

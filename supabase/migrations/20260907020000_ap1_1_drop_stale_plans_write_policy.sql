@@ -1,0 +1,28 @@
+-- ---------------------------------------------------------------------------
+-- AP1.1: drop the stale plans_admin_write policy.
+--
+-- public.plans carries a pre-AP0 policy, plans_admin_write (no FOR clause
+-- = applies to ALL commands, no TO clause = applies to every role),
+-- USING (EXISTS (SELECT 1 FROM admins WHERE admins.user_id = auth.uid())).
+-- It keyed off admins.user_id, which AP0 superseded with admins.email --
+-- every admins.user_id value is currently null, so this policy matches
+-- nobody today. But it contradicts the AP1 design (plans writes must be
+-- OWNER-ONLY, exclusively through the admin-write edge function, with
+-- audit logging): if admins.user_id were ever populated again for any
+-- reason, this stale policy would silently reopen direct, unlogged client
+-- writes to plans for any admin role, bypassing the owner-only rule and
+-- the audit trail entirely.
+--
+-- No replacement write policy is added -- plans stays client-read-only via
+-- its existing plans_public_read SELECT policy (untouched here); the
+-- admin-write edge function writes with service_role and bypasses RLS by
+-- design. No other table is touched.
+--
+-- Note for the record, not acted on here (out of this migration's
+-- explicit scope): plans still carries GRANT ALL to anon and authenticated
+-- from the original schema dump, which includes TRUNCATE -- a privilege
+-- RLS cannot restrict, the same class of gap P40 found and fixed on
+-- game_events. Worth a follow-up in the same shape as P40 if/when desired.
+-- ---------------------------------------------------------------------------
+
+DROP POLICY IF EXISTS plans_admin_write ON public.plans;
