@@ -9,3 +9,12 @@
 # Must be reachable with no Authorization header at all — this is the public,
 # unauthenticated deletion-info page Google Play requires a stable URL for.
 verify_jwt = false
+
+[functions.admin-write]
+# Requires a valid Supabase Auth JWT: the platform rejects unauthenticated
+# requests before the function even runs. The function itself re-derives
+# the caller's identity from that JWT (never trusts a client-supplied role
+# or email) and further requires an ACTIVE public.admins row for their
+# email before allowing any write. Deploy by name only:
+#   supabase functions deploy admin-write
+verify_jwt = true
