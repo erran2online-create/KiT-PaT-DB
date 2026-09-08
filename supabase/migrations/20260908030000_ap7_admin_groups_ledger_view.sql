@@ -15,24 +15,87 @@
 -- codes. It additionally requires a non-empty reason and an owner/org_admin
 -- role, and audits via log_admin_action.
 --
--- FLAGGED, NOT SILENTLY ASSUMED: log_admin_action (AP0/AP1) itself requires
--- the calling database session to be service_role (current_setting('role')
--- = 'service_role', or a service_role JWT role claim) -- true when
--- admin-write's sbService client calls it directly, and true for
--- AP2's admin-reveal edge function's OWN network call into admin_confirm_
--- reveal if that ever changed to a service client, but admin_void_ledger_
--- entry (like AP2's admin_confirm_reveal before it) is granted to
--- `authenticated` and designed to be called with the ADMIN'S OWN JWT
--- (needed for is_admin()/admin_role() to resolve the correct caller) rather
--- than via a service-role edge function. Whether PostgREST's per-request
--- role assignment satisfies log_admin_action's guard in that calling shape
--- is a runtime question this session cannot verify without live database
--- access. The call is implemented exactly as specified; this caveat is
--- called out explicitly per this repo's "verify outside this session,
--- never assert it works" rule -- test the audit row actually gets written
--- when this RPC is called the way the admin frontend will really call it
--- (the admin's own session, not a service-role client) before relying on it.
+-- AP7.1 UPDATE -- confirmed against the live database: log_admin_action's
+-- original guard --
+--   current_setting('role', true) = 'service_role' OR auth.jwt()->>'role' = 'service_role'
+-- -- is false for a SECURITY DEFINER function called directly with an
+-- admin's own JWT: PostgREST sets role = 'authenticated' for that request,
+-- and SECURITY DEFINER changes current_user (for privilege checks), never
+-- the 'role' GUC. admin_void_ledger_entry's log_admin_action call below
+-- would therefore RAISE KITPAT_ADMIN_ONLY and abort the whole void --
+-- and AP2's already-merged admin_confirm_reveal has the identical bug on
+-- its sensitive-reveal log. Section 0 below fixes the shared guard (the
+-- one place this rule is defined) rather than working around it in either
+-- caller: it now also accepts an already-verified active admin
+-- (public.is_admin(), itself SECURITY DEFINER and checked against the
+-- caller's own JWT email) as authorization to write an audit row, in
+-- addition to the original service_role path. admin_confirm_reveal and
+-- admin_void_ledger_entry themselves are unchanged -- fixing the shared
+-- guard repairs both.
 -- ---------------------------------------------------------------------------
+
+-- ---------------------------------------------------------------------------
+-- 0. log_admin_action -- widen the guard to ALSO accept an active admin,
+--    not just service_role. Same signature, params, insert and return as
+--    AP1's version; only the top IF condition gains an OR is_admin().
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.log_admin_action(
+  p_action text,
+  p_target_type text,
+  p_target_id text,
+  p_before jsonb,
+  p_after jsonb,
+  p_is_sensitive_reveal boolean DEFAULT false,
+  p_revealed_field text DEFAULT NULL,
+  p_revealed_subject text DEFAULT NULL,
+  p_actor_admin_id uuid DEFAULT NULL,
+  p_actor_email text DEFAULT NULL
+) RETURNS public.admin_audit
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public', 'pg_temp'
+AS $$
+DECLARE
+  caller_email text;
+  caller_admin_id uuid;
+  row_out public.admin_audit;
+BEGIN
+  IF NOT coalesce(
+    current_setting('role', true) = 'service_role'
+    OR (auth.jwt() ->> 'role') = 'service_role'
+    OR public.is_admin(),
+    false
+  ) THEN
+    RAISE EXCEPTION 'KITPAT_ADMIN_ONLY' USING ERRCODE = 'PT403';
+  END IF;
+
+  IF p_actor_admin_id IS NOT NULL OR p_actor_email IS NOT NULL THEN
+    caller_admin_id := p_actor_admin_id;
+    caller_email := p_actor_email;
+  ELSE
+    caller_email := auth.jwt() ->> 'email';
+    IF caller_email IS NOT NULL THEN
+      SELECT id INTO caller_admin_id FROM public.admins WHERE email = caller_email;
+    END IF;
+  END IF;
+
+  INSERT INTO public.admin_audit (
+    actor_admin_id, actor_email, action, target_type, target_id,
+    before, after, is_sensitive_reveal, revealed_field, revealed_subject
+  ) VALUES (
+    caller_admin_id, caller_email, p_action, p_target_type, p_target_id,
+    p_before, p_after, coalesce(p_is_sensitive_reveal, false), p_revealed_field, p_revealed_subject
+  ) RETURNING * INTO row_out;
+
+  RETURN row_out;
+END;
+$$;
+
+COMMENT ON FUNCTION public.log_admin_action(text, text, text, jsonb, jsonb, boolean, text, text, uuid, text) IS
+  'service_role OR an already-active admin (checked via current_setting(''role'')/the caller''s JWT role claim, OR public.is_admin() against the caller''s own JWT email) may write an audit row. Inserts one admin_audit row. Actor is p_actor_admin_id/p_actor_email when explicitly given, else auto-detected from the caller''s own auth.jwt()->>''email''. Errors: KITPAT_ADMIN_ONLY.';
+
+REVOKE ALL ON FUNCTION public.log_admin_action(text, text, text, jsonb, jsonb, boolean, text, text, uuid, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.log_admin_action(text, text, text, jsonb, jsonb, boolean, text, text, uuid, text) TO authenticated, service_role;
 
 -- ---------------------------------------------------------------------------
 -- 1. admin_list_groups(p_search, p_limit, p_offset)
@@ -361,7 +424,7 @@ END;
 $$;
 
 COMMENT ON FUNCTION public.admin_void_ledger_entry(uuid, text, text) IS
-  'Owner/org_admin only (member admins rejected). Mirrors void_contribution/void_kitty_expense exactly: sets voided_at/voided_by/void_reason and re-settles the pool total from non-voided rows in the same transaction; never hard-deletes. p_reason is mandatory (trimmed non-empty). Audits via log_admin_action(''void:''||p_kind, ...) -- see this migration''s header for a flagged, unverified caveat about log_admin_action''s service-role calling-context guard. Errors: KITPAT_INSUFFICIENT_ROLE / KITPAT_INVALID_KIND / KITPAT_REASON_REQUIRED / KITPAT_NOT_FOUND / KITPAT_ALREADY_VOIDED.';
+  'Owner/org_admin only (member admins rejected). Mirrors void_contribution/void_kitty_expense exactly: sets voided_at/voided_by/void_reason and re-settles the pool total from non-voided rows in the same transaction; never hard-deletes. p_reason is mandatory (trimmed non-empty). Audits via log_admin_action(''void:''||p_kind, ...) -- see section 0 above (AP7.1) for the log_admin_action guard fix that makes this call succeed when invoked directly with the admin''s own JWT. Errors: KITPAT_INSUFFICIENT_ROLE / KITPAT_INVALID_KIND / KITPAT_REASON_REQUIRED / KITPAT_NOT_FOUND / KITPAT_ALREADY_VOIDED.';
 
 REVOKE ALL ON FUNCTION public.admin_void_ledger_entry(uuid, text, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.admin_void_ledger_entry(uuid, text, text) TO authenticated, service_role;

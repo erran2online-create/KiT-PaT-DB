@@ -1,17 +1,18 @@
--- AP7 test: admin_list_groups, admin_group_detail, admin_list_ledger, and
--- admin_void_ledger_entry.
+-- AP7 test: admin_list_groups, admin_group_detail, admin_list_ledger,
+-- admin_void_ledger_entry, and (AP7.1) the log_admin_action guard fix that
+-- both admin_void_ledger_entry and AP2's admin_confirm_reveal depend on.
 --
--- CAVEAT carried over from this migration's own header, repeated here so it
--- is visible at the point it matters: log_admin_action (AP0) requires the
--- calling database session to be service_role. This test's admin actors
--- are simulated purely via request.jwt.claims (auth.jwt()/auth.uid()),
--- exactly like every other test in this repo -- it does NOT (and cannot,
--- from a plain psql connection) reproduce PostgREST's per-request SET ROLE
--- behavior. If the "writes an admin_audit row" assertion below fails while
--- every other assertion in this file passes, that failure is pointing at
--- log_admin_action's calling-context guard, not at admin_void_ledger_entry's
--- void/re-settle logic (which is asserted independently and directly above
--- it). See this migration's header comment for the full explanation.
+-- AP7.1 background: log_admin_action originally required the calling
+-- database session to be service_role. Confirmed against the live
+-- database that this is false for a SECURITY DEFINER function called
+-- directly with an admin's own JWT (PostgREST sets role='authenticated';
+-- SECURITY DEFINER changes current_user, never the 'role' GUC) -- so
+-- admin_void_ledger_entry's log call would have raised KITPAT_ADMIN_ONLY
+-- and aborted the whole void. This migration widens log_admin_action's
+-- guard to also accept an already-active admin (public.is_admin()).
+-- Section 0 below proves that guard directly; section 5 then proves the
+-- real consequence -- admin_void_ledger_entry actually writes its
+-- admin_audit row when called the way the admin frontend really calls it.
 --
 -- Self-contained and non-destructive: everything happens inside one
 -- transaction that is ROLLED BACK at the end, so it can be run against any
@@ -24,6 +25,9 @@
 -- "PASS" notices and rolls back.
 --
 -- Proves:
+--   0. log_admin_action succeeds for an active admin called directly with
+--      role='authenticated' (not service_role), still succeeds for
+--      service_role, and still raises KITPAT_ADMIN_ONLY for a non-admin.
 --   1. admin_list_groups/admin_group_detail/admin_list_ledger raise
 --      KITPAT_ADMIN_ONLY for a non-admin; admin_void_ledger_entry raises
 --      KITPAT_INSUFFICIENT_ROLE for a non-admin/member admin (its own,
@@ -39,7 +43,7 @@
 --      reason, KITPAT_INSUFFICIENT_ROLE for a 'member' admin, voids
 --      correctly for an org_admin and reduces the pool total by exactly
 --      that amount, raises KITPAT_ALREADY_VOIDED on a second attempt, and
---      (see CAVEAT above) writes an admin_audit row.
+--      writes an admin_audit row (the AP7.1 fix in action).
 --   6. A plain member's own RLS view of the group/ledger is unchanged
 --      (still sees only what they could see before this migration).
 
@@ -69,6 +73,7 @@ DECLARE
   voided_row_count integer;
   audit_count integer;
   member_visible_count integer;
+  logged_row public.admin_audit;
 BEGIN
   ------------------------------------------------------------------ fixtures
   INSERT INTO public.admins (email, role, is_active) VALUES
@@ -103,6 +108,44 @@ BEGIN
   INSERT INTO public.kitty_expenses (pool_id, added_by, amount, vendor) VALUES (pool_id, host_user_id, 200, 'AP7 Test Vendor') RETURNING id INTO expense_id;
 
   -- org_admin_actor_id is deliberately NOT added as a member of group_id.
+
+  ------------------------------------------------- 0. log_admin_action guard (AP7.1)
+  -- 0a. Genuinely non-admin caller (no admins row), role=authenticated,
+  -- not service_role: still rejected.
+  PERFORM set_config('request.jwt.claims', jsonb_build_object('email', non_admin_email, 'role', 'authenticated')::text, true);
+  SET LOCAL ROLE authenticated;
+  BEGIN
+    logged_row := public.log_admin_action('ap7_unauthorized_attempt', 'test', 'x', NULL, NULL);
+    RAISE EXCEPTION 'FAIL: log_admin_action succeeded for a non-admin, non-service_role caller';
+  EXCEPTION WHEN OTHERS THEN
+    err := SQLERRM;
+    IF err <> 'KITPAT_ADMIN_ONLY' THEN
+      RESET ROLE;
+      RAISE EXCEPTION 'FAIL: non-admin log_admin_action call raised "%", expected KITPAT_ADMIN_ONLY', err;
+    END IF;
+  END;
+  RESET ROLE;
+
+  -- 0b. An active admin (org_admin_email) called directly with their own
+  -- JWT -- role=authenticated, NOT service_role -- succeeds. This is
+  -- exactly the calling shape admin_void_ledger_entry uses in section 5.
+  PERFORM set_config('request.jwt.claims', jsonb_build_object('email', org_admin_email, 'role', 'authenticated')::text, true);
+  SET LOCAL ROLE authenticated;
+  logged_row := public.log_admin_action('ap7_active_admin_direct_call', 'test', 'x', NULL, NULL);
+  RESET ROLE;
+  IF logged_row.id IS NULL OR logged_row.actor_email <> org_admin_email THEN
+    RAISE EXCEPTION 'FAIL: log_admin_action for an active admin called directly (role=authenticated) did not succeed / resolve the actor correctly: %', logged_row;
+  END IF;
+
+  -- 0c. service_role still works exactly as before.
+  SET LOCAL ROLE service_role;
+  PERFORM set_config('request.jwt.claims', jsonb_build_object('email', owner_email, 'role', 'service_role')::text, true);
+  logged_row := public.log_admin_action('ap7_service_role_call', 'test', 'x', NULL, NULL);
+  RESET ROLE;
+  IF logged_row.id IS NULL THEN
+    RAISE EXCEPTION 'FAIL: log_admin_action as service_role did not return an inserted row';
+  END IF;
+  RAISE NOTICE 'PASS: log_admin_action raises KITPAT_ADMIN_ONLY for a non-admin, succeeds for an active admin called directly with role=authenticated (AP7.1), and still succeeds as service_role';
 
   --------------------------------------------------- 1. KITPAT_ADMIN_ONLY / role gate
   PERFORM set_config('request.jwt.claims', jsonb_build_object('email', non_admin_email, 'role', 'authenticated')::text, true);
@@ -247,17 +290,15 @@ BEGIN
   END;
   RAISE NOTICE 'PASS: a second void attempt raises KITPAT_ALREADY_VOIDED';
 
-  -- See this file's CAVEAT header: this specific assertion depends on
-  -- log_admin_action's service-role calling-context guard, which a plain
-  -- psql session (no PostgREST-style SET ROLE) may not satisfy.
+  -- AP7.1: with log_admin_action's guard widened (section 0 above), this
+  -- now must succeed -- no more "note, don't fail" hedging.
   SELECT count(*) INTO audit_count
   FROM public.admin_audit
   WHERE action = 'void:contribution' AND target_id = contrib_b_id::text;
   IF audit_count = 0 THEN
-    RAISE NOTICE 'NOTE: no admin_audit row found for the void above -- see this file''s CAVEAT header regarding log_admin_action''s service-role calling-context guard; this does not indicate a bug in the void/re-settle logic itself, which was independently verified above.';
-  ELSE
-    RAISE NOTICE 'PASS: admin_void_ledger_entry wrote an admin_audit row for the void';
+    RAISE EXCEPTION 'FAIL: admin_void_ledger_entry did not write an admin_audit row for the void';
   END IF;
+  RAISE NOTICE 'PASS: admin_void_ledger_entry wrote an admin_audit row for the void';
 
   SELECT count(*) INTO ledger_count FROM public.admin_list_ledger(pool_id);
   IF ledger_count <> 3 THEN

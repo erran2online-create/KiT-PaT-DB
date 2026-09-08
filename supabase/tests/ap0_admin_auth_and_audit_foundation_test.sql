@@ -5,6 +5,16 @@
 -- database that already has the AP0 migration
 -- (20260906030000_ap0_admin_auth_and_audit_foundation.sql) applied.
 --
+-- Section 5 additionally depends on AP7.1's log_admin_action guard widening
+-- (in 20260908030000_ap7_admin_groups_ledger_view.sql): before that fix,
+-- log_admin_action required the calling database session to be
+-- service_role, full stop. AP7.1 widened it to ALSO accept an
+-- already-active admin (any role) called directly with their own JWT
+-- (role='authenticated'), since neither PostgREST's per-request role nor a
+-- SECURITY DEFINER call changes the 'role' GUC the original guard checked.
+-- Running this file against a database with ONLY AP0 (not yet AP7.1)
+-- applied will fail section 5's new positive-case assertion.
+--
 --   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/tests/ap0_admin_auth_and_audit_foundation_test.sql
 --
 -- Any failed assertion aborts with a "FAIL: ..." exception. Success prints
@@ -17,9 +27,11 @@
 --      simulated owner vs a simulated non-admin.
 --   4. An is_sensitive_reveal=true admin_audit row is visible to an owner
 --      and hidden from a non-owner admin.
---   5. log_admin_action raises KITPAT_ADMIN_ONLY for a non-service_role
---      caller, and succeeds (inserting a row, resolving the actor) when
---      called as service_role.
+--   5. log_admin_action raises KITPAT_ADMIN_ONLY for a genuinely non-admin
+--      caller (role='authenticated', no admins row); succeeds (inserting a
+--      row, resolving the actor) for an active admin called directly with
+--      their own JWT (role='authenticated', not service_role -- AP7.1); and
+--      still succeeds when called as service_role.
 --   6. plans Empress/Queen carry the new name_neutral/variant columns;
 --      Free/Starter are untouched; existing name/slug are untouched
 --      everywhere.
@@ -119,20 +131,40 @@ BEGIN
   RAISE NOTICE 'PASS: an is_sensitive_reveal=true admin_audit row is visible to an owner, hidden from a non-owner active admin, and non-reveal rows are visible to any active admin';
 
   --------------------------------------------------- 5. log_admin_action guard
-  PERFORM set_config('request.jwt.claims', jsonb_build_object('email', test_admin_email, 'role', 'authenticated')::text, true);
+  -- 5a. Genuinely non-admin caller (no admins row at all), role=authenticated,
+  -- not service_role: still rejected.
+  PERFORM set_config('request.jwt.claims', jsonb_build_object('email', test_nonadmin_email, 'role', 'authenticated')::text, true);
   SET LOCAL ROLE authenticated;
   BEGIN
     logged_row := public.log_admin_action('unauthorized_attempt', 'test', 'x', NULL, NULL);
-    RAISE EXCEPTION 'FAIL: log_admin_action succeeded for a non-service_role caller';
+    RAISE EXCEPTION 'FAIL: log_admin_action succeeded for a non-admin, non-service_role caller';
   EXCEPTION WHEN OTHERS THEN
     err := SQLERRM;
     IF err <> 'KITPAT_ADMIN_ONLY' THEN
       RESET ROLE;
-      RAISE EXCEPTION 'FAIL: non-service_role log_admin_action call raised "%", expected KITPAT_ADMIN_ONLY', err;
+      RAISE EXCEPTION 'FAIL: non-admin log_admin_action call raised "%", expected KITPAT_ADMIN_ONLY', err;
     END IF;
   END;
   RESET ROLE;
 
+  -- 5b. AP7.1: an ACTIVE admin (test_admin_email, role=member, seeded
+  -- above) called directly with their own JWT -- role=authenticated, NOT
+  -- service_role -- now succeeds, since log_admin_action's guard also
+  -- accepts public.is_admin(). This is the exact calling shape
+  -- admin_void_ledger_entry and admin_confirm_reveal use.
+  PERFORM set_config('request.jwt.claims', jsonb_build_object('email', test_admin_email, 'role', 'authenticated')::text, true);
+  SET LOCAL ROLE authenticated;
+  logged_row := public.log_admin_action('member_admin_direct_call', 'test', 'x', NULL, NULL);
+  RESET ROLE;
+
+  IF logged_row.id IS NULL THEN
+    RAISE EXCEPTION 'FAIL: log_admin_action for an active admin called directly (role=authenticated, not service_role) did not return an inserted row';
+  END IF;
+  IF logged_row.actor_email <> test_admin_email THEN
+    RAISE EXCEPTION 'FAIL: log_admin_action (active admin, direct call) resolved actor_email=%, expected %', logged_row.actor_email, test_admin_email;
+  END IF;
+
+  -- 5c. service_role still works exactly as before.
   SET LOCAL ROLE service_role;
   PERFORM set_config('request.jwt.claims', jsonb_build_object('email', 'aps@kitpat.in', 'role', 'service_role')::text, true);
   logged_row := public.log_admin_action('granted_plan_override', 'plan', 'some-plan-id', '{"tier":"free"}'::jsonb, '{"tier":"elite"}'::jsonb);
@@ -144,7 +176,7 @@ BEGIN
   IF logged_row.actor_email <> 'aps@kitpat.in' OR logged_row.actor_admin_id <> owner_row.id THEN
     RAISE EXCEPTION 'FAIL: log_admin_action did not resolve the actor from the caller''s admins record (actor_email=%, actor_admin_id=%)', logged_row.actor_email, logged_row.actor_admin_id;
   END IF;
-  RAISE NOTICE 'PASS: log_admin_action raises KITPAT_ADMIN_ONLY for a non-service_role caller, and succeeds (inserting a row and resolving the actor) when called as service_role';
+  RAISE NOTICE 'PASS: log_admin_action raises KITPAT_ADMIN_ONLY for a genuinely non-admin caller, succeeds for an active admin called directly with role=authenticated (AP7.1), and still succeeds when called as service_role';
 
   --------------------------------------------------- 6. plan name neutraliser
   SELECT * INTO empress_row FROM public.plans WHERE name = 'Empress';
