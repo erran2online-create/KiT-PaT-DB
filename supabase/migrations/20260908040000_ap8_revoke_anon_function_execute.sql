@@ -36,11 +36,33 @@
 --      function never receives the grant at CREATE time in the first
 --      place. Scoped to role postgres (the role a migration runs as) and
 --      to schema public only -- it does not touch tables, sequences, or
---      any other schema. This scoping is confirmed COMPLETE for this
---      project, not just "probably fine": the baseline dump's matching
---      entry for role supabase_admin (lines 5178-5181) is commented out
---      in the dump, meaning it was never actually run -- ROLE postgres is
---      the only creating role that ever set this default ACL here.
+--      any other schema.
+--
+--      AP8.1 CORRECTION: this scoping is INCOMPLETE IN PRINCIPLE, not
+--      total. The dump's commented-out supabase_admin default-privilege
+--      line is not authoritative -- it only reflects what pg_dump chose
+--      to emit as a comment, not the live catalog. Checked directly
+--      against the live database (pg_default_acl): a supabase_admin
+--      default ACL for public functions EXISTS ALONGSIDE postgres's,
+--      granting anon,authenticated,service_role too. This statement
+--      cannot reach that second default ACL --
+--      `ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin ...` would
+--      require postgres to be a member of supabase_admin
+--      (pg_has_role('postgres','supabase_admin','MEMBER') is false, live
+--      -confirmed), so it is deliberately NOT attempted here -- it would
+--      raise a permission error and abort the whole migration.
+--
+--      In PRACTICE, for this repo, the fix is total anyway: every one of
+--      the 109 functions currently in schema public is owned by postgres
+--      (live-confirmed: distinct owner count = 1), and `supabase db push`
+--      runs migrations as postgres, so every function this repo ever
+--      creates is covered by the one default ACL this statement can
+--      reach. The gap only matters if something someday creates a
+--      public function as supabase_admin (e.g. directly via the
+--      Supabase dashboard/support tooling, not through a migration) --
+--      that function would need its anon grant revoked by hand (or via
+--      a future migration's explicit REVOKE, same as the sweep above
+--      does today for existing functions).
 --   3. RE-ASSERT the two allow-listed grants at the end, so this file's
 --      three sections are order-independent.
 --

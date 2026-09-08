@@ -30,6 +30,16 @@
 --      `REVOKE ALL ... FROM PUBLIC` (this repo's standing pattern), has
 --      NO anon EXECUTE at all -- proving the root-cause default-privilege
 --      fix is live, not just the one-time sweep.
+--
+-- NOTE on (f): this assertion is only valid when this file is run AS ROLE
+-- postgres. The migration's ALTER DEFAULT PRIVILEGES statement is
+-- attached specifically to role postgres (see that migration's own header
+-- for why this is total in practice for this repo, though incomplete in
+-- principle relative to a second, unreachable supabase_admin default ACL
+-- confirmed to exist on the live database). A throwaway function created
+-- by a different role picks up THAT role's own default privileges, which
+-- this migration never touched -- running this test under another role
+-- could fail (f) misleadingly, pointing at a regression that isn't there.
 
 BEGIN;
 
