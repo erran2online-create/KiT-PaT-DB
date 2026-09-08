@@ -5,15 +5,21 @@
 -- database that already has the AP0 migration
 -- (20260906030000_ap0_admin_auth_and_audit_foundation.sql) applied.
 --
--- Section 5 additionally depends on AP7.1's log_admin_action guard widening
--- (in 20260908030000_ap7_admin_groups_ledger_view.sql): before that fix,
+-- Section 5 additionally depends on AP7.1/AP7.2's log_admin_action changes
+-- (in 20260908030000_ap7_admin_groups_ledger_view.sql): before AP7.1,
 -- log_admin_action required the calling database session to be
 -- service_role, full stop. AP7.1 widened it to ALSO accept an
 -- already-active admin (any role) called directly with their own JWT
 -- (role='authenticated'), since neither PostgREST's per-request role nor a
 -- SECURITY DEFINER call changes the 'role' GUC the original guard checked.
--- Running this file against a database with ONLY AP0 (not yet AP7.1)
--- applied will fail section 5's new positive-case assertion.
+-- AP7.2 then closed a gap that widening opened: the p_actor_admin_id/
+-- p_actor_email actor override was left ungated, so a non-service caller
+-- (e.g. a role='member' admin) could pass someone else's identity as the
+-- override and author an audit row attributed to a different admin --
+-- including a forged is_sensitive_reveal row. AP7.2 gates the override on
+-- a service_role caller only. Running this file against a database with
+-- ONLY AP0 (not yet AP7.1/AP7.2) applied will fail section 5's new
+-- positive-case and forged-override assertions.
 --
 --   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/tests/ap0_admin_auth_and_audit_foundation_test.sql
 --
@@ -30,8 +36,10 @@
 --   5. log_admin_action raises KITPAT_ADMIN_ONLY for a genuinely non-admin
 --      caller (role='authenticated', no admins row); succeeds (inserting a
 --      row, resolving the actor) for an active admin called directly with
---      their own JWT (role='authenticated', not service_role -- AP7.1); and
---      still succeeds when called as service_role.
+--      their own JWT (role='authenticated', not service_role -- AP7.1);
+--      still succeeds when called as service_role; and (AP7.2) rejects a
+--      member admin's forged actor override, attributing the row to the
+--      member instead of whoever they tried to impersonate.
 --   6. plans Empress/Queen carry the new name_neutral/variant columns;
 --      Free/Starter are untouched; existing name/slug are untouched
 --      everywhere.
@@ -176,7 +184,31 @@ BEGIN
   IF logged_row.actor_email <> 'aps@kitpat.in' OR logged_row.actor_admin_id <> owner_row.id THEN
     RAISE EXCEPTION 'FAIL: log_admin_action did not resolve the actor from the caller''s admins record (actor_email=%, actor_admin_id=%)', logged_row.actor_email, logged_row.actor_admin_id;
   END IF;
-  RAISE NOTICE 'PASS: log_admin_action raises KITPAT_ADMIN_ONLY for a genuinely non-admin caller, succeeds for an active admin called directly with role=authenticated (AP7.1), and still succeeds when called as service_role';
+
+  -- 5d. AP7.2: test_admin_email (role=member, an active admin, NOT
+  -- service_role) calls log_admin_action passing the OWNER's identity as
+  -- the actor override, including a sensitive-reveal shape. The override
+  -- must be ignored entirely for a non-service caller -- the inserted row
+  -- must be attributed to the member's own JWT identity, never the
+  -- owner's. This is the exact forged-reveal-audit-row path AP7.2 closes
+  -- (reproduced live: a member wrote a row with actor_email='aps@kitpat.in',
+  -- is_sensitive_reveal=true, revealed_field='phone').
+  PERFORM set_config('request.jwt.claims', jsonb_build_object('email', test_admin_email, 'role', 'authenticated')::text, true);
+  SET LOCAL ROLE authenticated;
+  logged_row := public.log_admin_action(
+    'forged_actor_attempt', 'users', 'some-user-id', NULL, NULL,
+    true, 'phone', 'some-user-id',
+    owner_row.id, 'aps@kitpat.in'
+  );
+  RESET ROLE;
+  IF logged_row.actor_email = 'aps@kitpat.in' OR logged_row.actor_admin_id = owner_row.id THEN
+    RAISE EXCEPTION 'FAIL: a member admin''s forged actor override was honoured -- row attributed to %/%, expected the member''s own identity', logged_row.actor_email, logged_row.actor_admin_id;
+  END IF;
+  IF logged_row.actor_email <> test_admin_email THEN
+    RAISE EXCEPTION 'FAIL: log_admin_action (member admin, forged override) resolved actor_email=%, expected the member''s own %', logged_row.actor_email, test_admin_email;
+  END IF;
+
+  RAISE NOTICE 'PASS: log_admin_action raises KITPAT_ADMIN_ONLY for a genuinely non-admin caller, succeeds for an active admin called directly with role=authenticated (AP7.1), still succeeds when called as service_role, and (AP7.2) rejects a member admin''s forged actor override by attributing the row to the member instead';
 
   --------------------------------------------------- 6. plan name neutraliser
   SELECT * INTO empress_row FROM public.plans WHERE name = 'Empress';

@@ -32,12 +32,43 @@
 -- addition to the original service_role path. admin_confirm_reveal and
 -- admin_void_ledger_entry themselves are unchanged -- fixing the shared
 -- guard repairs both.
+--
+-- AP7.2 UPDATE -- the AP7.1 guard widening above was itself incomplete,
+-- verified by reproduction: it added `OR public.is_admin()` to the entry
+-- guard but left the p_actor_admin_id/p_actor_email OVERRIDE ungated. Those
+-- two params exist solely so the admin-write edge function -- whose
+-- service_role JWT carries no email claim -- can tell log_admin_action who
+-- the acting admin actually is (see AP1's header). Once any active admin
+-- could pass the entry guard directly with their own JWT, nothing stopped
+-- a role='member' admin from ALSO supplying the override and authoring an
+-- audit row attributed to a DIFFERENT admin -- including a forged
+-- is_sensitive_reveal row, which AP0's RLS policy restricts to owners only.
+-- Reproduced: member@kitpat.in wrote a row with actor_email='aps@kitpat.in',
+-- is_sensitive_reveal=true, revealed_field='phone'.
+--
+-- Fixed below by gating the override on is_service ONLY: a direct admin
+-- caller is now always attributed to their own JWT identity, regardless of
+-- what they pass in p_actor_admin_id/p_actor_email. This is
+-- behaviour-preserving for AP2/AP7's real callers: admin-write's sbService
+-- client is the only caller that is actually service_role, and
+-- admin_confirm_reveal's override values already equal what
+-- self-resolution would produce for that same caller, so neither existing
+-- caller changes behaviour -- only a member admin's forged override is now
+-- rejected. admin_confirm_reveal and admin_void_ledger_entry themselves
+-- are unchanged.
+--
+-- Also fixed: anon still held EXECUTE on log_admin_action. `REVOKE ALL ...
+-- FROM PUBLIC` does not remove Supabase's own default-privilege grant to
+-- anon -- an explicit `REVOKE EXECUTE ... FROM anon` is required, added
+-- below.
 -- ---------------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------------
--- 0. log_admin_action -- widen the guard to ALSO accept an active admin,
---    not just service_role. Same signature, params, insert and return as
---    AP1's version; only the top IF condition gains an OR is_admin().
+-- 0. log_admin_action -- widen the entry guard to ALSO accept an active
+--    admin, not just service_role (AP7.1); gate the actor override on
+--    service_role only, so a direct admin caller can never author an
+--    audit row attributed to someone else (AP7.2). Same signature,
+--    DECLARE'd row_out, INSERT column list and RETURN as AP1's version.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.log_admin_action(
   p_action text,
@@ -56,20 +87,27 @@ SECURITY DEFINER
 SET search_path TO 'public', 'pg_temp'
 AS $$
 DECLARE
+  is_service boolean;
   caller_email text;
   caller_admin_id uuid;
   row_out public.admin_audit;
 BEGIN
-  IF NOT coalesce(
+  is_service := coalesce(
     current_setting('role', true) = 'service_role'
-    OR (auth.jwt() ->> 'role') = 'service_role'
-    OR public.is_admin(),
+    OR (auth.jwt() ->> 'role') = 'service_role',
     false
-  ) THEN
+  );
+
+  IF NOT (is_service OR coalesce(public.is_admin(), false)) THEN
     RAISE EXCEPTION 'KITPAT_ADMIN_ONLY' USING ERRCODE = 'PT403';
   END IF;
 
-  IF p_actor_admin_id IS NOT NULL OR p_actor_email IS NOT NULL THEN
+  -- The actor override exists only for the admin-write edge function's
+  -- service_role client (whose JWT carries no email claim). A direct
+  -- caller -- including an active admin who now passes the entry guard on
+  -- their own -- is always attributed to their own JWT identity, never to
+  -- whatever they pass in p_actor_admin_id/p_actor_email.
+  IF is_service AND (p_actor_admin_id IS NOT NULL OR p_actor_email IS NOT NULL) THEN
     caller_admin_id := p_actor_admin_id;
     caller_email := p_actor_email;
   ELSE
@@ -92,9 +130,10 @@ END;
 $$;
 
 COMMENT ON FUNCTION public.log_admin_action(text, text, text, jsonb, jsonb, boolean, text, text, uuid, text) IS
-  'service_role OR an already-active admin (checked via current_setting(''role'')/the caller''s JWT role claim, OR public.is_admin() against the caller''s own JWT email) may write an audit row. Inserts one admin_audit row. Actor is p_actor_admin_id/p_actor_email when explicitly given, else auto-detected from the caller''s own auth.jwt()->>''email''. Errors: KITPAT_ADMIN_ONLY.';
+  'service_role OR an already-active admin (public.is_admin(), against the caller''s own JWT email) may write an audit row. The p_actor_admin_id/p_actor_email override is honoured ONLY for service_role callers (the admin-write edge function, whose JWT carries no email claim) -- a direct admin caller is always attributed to their own JWT identity, so a member admin cannot author an audit row (including a sensitive reveal) as a different admin. Errors: KITPAT_ADMIN_ONLY.';
 
 REVOKE ALL ON FUNCTION public.log_admin_action(text, text, text, jsonb, jsonb, boolean, text, text, uuid, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.log_admin_action(text, text, text, jsonb, jsonb, boolean, text, text, uuid, text) FROM anon;
 GRANT EXECUTE ON FUNCTION public.log_admin_action(text, text, text, jsonb, jsonb, boolean, text, text, uuid, text) TO authenticated, service_role;
 
 -- ---------------------------------------------------------------------------

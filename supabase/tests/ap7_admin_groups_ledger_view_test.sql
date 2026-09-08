@@ -1,6 +1,7 @@
 -- AP7 test: admin_list_groups, admin_group_detail, admin_list_ledger,
--- admin_void_ledger_entry, and (AP7.1) the log_admin_action guard fix that
--- both admin_void_ledger_entry and AP2's admin_confirm_reveal depend on.
+-- admin_void_ledger_entry, and (AP7.1/AP7.2) the log_admin_action guard
+-- fix that both admin_void_ledger_entry and AP2's admin_confirm_reveal
+-- depend on.
 --
 -- AP7.1 background: log_admin_action originally required the calling
 -- database session to be service_role. Confirmed against the live
@@ -8,11 +9,23 @@
 -- directly with an admin's own JWT (PostgREST sets role='authenticated';
 -- SECURITY DEFINER changes current_user, never the 'role' GUC) -- so
 -- admin_void_ledger_entry's log call would have raised KITPAT_ADMIN_ONLY
--- and aborted the whole void. This migration widens log_admin_action's
--- guard to also accept an already-active admin (public.is_admin()).
--- Section 0 below proves that guard directly; section 5 then proves the
--- real consequence -- admin_void_ledger_entry actually writes its
--- admin_audit row when called the way the admin frontend really calls it.
+-- and aborted the whole void. AP7.1 widened log_admin_action's guard to
+-- also accept an already-active admin (public.is_admin()).
+--
+-- AP7.2 background: verified by reproduction that the AP7.1 widening was
+-- itself incomplete -- it left the p_actor_admin_id/p_actor_email actor
+-- OVERRIDE ungated, so any active admin who could now pass the entry
+-- guard directly could ALSO supply that override and author an audit row
+-- attributed to a different admin, including a forged is_sensitive_reveal
+-- row (owner-only per AP0's RLS). AP7.2 gates the override on a
+-- service_role caller only, and revokes anon's EXECUTE (REVOKE ALL FROM
+-- PUBLIC alone does not remove Supabase's own default grant to anon).
+--
+-- Section 0 below proves the full guard directly (including the closed
+-- forgery path and the anon revoke); section 5 then proves the real
+-- consequence -- admin_void_ledger_entry actually writes its admin_audit
+-- row, correctly attributed, when called the way the admin frontend
+-- really calls it.
 --
 -- Self-contained and non-destructive: everything happens inside one
 -- transaction that is ROLLED BACK at the end, so it can be run against any
@@ -26,8 +39,12 @@
 --
 -- Proves:
 --   0. log_admin_action succeeds for an active admin called directly with
---      role='authenticated' (not service_role), still succeeds for
---      service_role, and still raises KITPAT_ADMIN_ONLY for a non-admin.
+--      role='authenticated' and no override (attributed to themselves);
+--      raises KITPAT_ADMIN_ONLY for a genuine non-admin; succeeds for
+--      service_role while honouring its actor override (admin-write's
+--      path); REJECTS a role='member' admin's forged actor override,
+--      attributing the row to the member's own identity instead; and
+--      confirms anon holds no EXECUTE privilege on it.
 --   1. admin_list_groups/admin_group_detail/admin_list_ledger raise
 --      KITPAT_ADMIN_ONLY for a non-admin; admin_void_ledger_entry raises
 --      KITPAT_INSUFFICIENT_ROLE for a non-admin/member admin (its own,
@@ -43,7 +60,7 @@
 --      reason, KITPAT_INSUFFICIENT_ROLE for a 'member' admin, voids
 --      correctly for an org_admin and reduces the pool total by exactly
 --      that amount, raises KITPAT_ALREADY_VOIDED on a second attempt, and
---      writes an admin_audit row (the AP7.1 fix in action).
+--      writes an admin_audit row (the AP7.1/AP7.2 guard fix in action).
 --   6. A plain member's own RLS view of the group/ledger is unchanged
 --      (still sees only what they could see before this migration).
 
@@ -74,6 +91,8 @@ DECLARE
   audit_count integer;
   member_visible_count integer;
   logged_row public.admin_audit;
+  owner_admin_id uuid;
+  anon_has_execute boolean;
 BEGIN
   ------------------------------------------------------------------ fixtures
   INSERT INTO public.admins (email, role, is_active) VALUES
@@ -109,8 +128,21 @@ BEGIN
 
   -- org_admin_actor_id is deliberately NOT added as a member of group_id.
 
-  ------------------------------------------------- 0. log_admin_action guard (AP7.1)
-  -- 0a. Genuinely non-admin caller (no admins row), role=authenticated,
+  ------------------------------------------------- 0. log_admin_action guard (AP7.1/AP7.2)
+  SELECT id INTO owner_admin_id FROM public.admins WHERE email = owner_email;
+
+  -- 0a. Active admin, role=authenticated, own JWT, no override: row
+  -- written, actor_email = that admin. This is exactly the calling shape
+  -- admin_void_ledger_entry uses in section 5.
+  PERFORM set_config('request.jwt.claims', jsonb_build_object('email', org_admin_email, 'role', 'authenticated')::text, true);
+  SET LOCAL ROLE authenticated;
+  logged_row := public.log_admin_action('ap7_active_admin_direct_call', 'test', 'x', NULL, NULL);
+  RESET ROLE;
+  IF logged_row.id IS NULL OR logged_row.actor_email <> org_admin_email THEN
+    RAISE EXCEPTION 'FAIL: log_admin_action for an active admin called directly (role=authenticated) did not succeed / resolve the actor correctly: %', logged_row;
+  END IF;
+
+  -- 0b. Genuinely non-admin caller (no admins row), role=authenticated,
   -- not service_role: still rejected.
   PERFORM set_config('request.jwt.claims', jsonb_build_object('email', non_admin_email, 'role', 'authenticated')::text, true);
   SET LOCAL ROLE authenticated;
@@ -126,26 +158,51 @@ BEGIN
   END;
   RESET ROLE;
 
-  -- 0b. An active admin (org_admin_email) called directly with their own
-  -- JWT -- role=authenticated, NOT service_role -- succeeds. This is
-  -- exactly the calling shape admin_void_ledger_entry uses in section 5.
-  PERFORM set_config('request.jwt.claims', jsonb_build_object('email', org_admin_email, 'role', 'authenticated')::text, true);
-  SET LOCAL ROLE authenticated;
-  logged_row := public.log_admin_action('ap7_active_admin_direct_call', 'test', 'x', NULL, NULL);
+  -- 0c. service_role WITH an actor override: row written, actor_email =
+  -- the overridden address -- admin-write's own calling path (it always
+  -- knows the acting admin's identity itself, having already verified it
+  -- via auth.getUser() + an admins lookup, and passes it explicitly since
+  -- its own JWT carries no email claim) still works exactly as before.
+  SET LOCAL ROLE service_role;
+  PERFORM set_config('request.jwt.claims', jsonb_build_object('role', 'service_role')::text, true);
+  logged_row := public.log_admin_action('ap7_service_role_call', 'test', 'x', NULL, NULL, false, NULL, NULL, owner_admin_id, owner_email);
   RESET ROLE;
-  IF logged_row.id IS NULL OR logged_row.actor_email <> org_admin_email THEN
-    RAISE EXCEPTION 'FAIL: log_admin_action for an active admin called directly (role=authenticated) did not succeed / resolve the actor correctly: %', logged_row;
+  IF logged_row.id IS NULL OR logged_row.actor_email <> owner_email OR logged_row.actor_admin_id <> owner_admin_id THEN
+    RAISE EXCEPTION 'FAIL: log_admin_action as service_role with an actor override did not honour it: %', logged_row;
   END IF;
 
-  -- 0c. service_role still works exactly as before.
-  SET LOCAL ROLE service_role;
-  PERFORM set_config('request.jwt.claims', jsonb_build_object('email', owner_email, 'role', 'service_role')::text, true);
-  logged_row := public.log_admin_action('ap7_service_role_call', 'test', 'x', NULL, NULL);
+  -- 0d. AP7.2: a role=member active admin calls log_admin_action passing
+  -- someone ELSE's identity as the override. The override must be
+  -- ignored entirely for a non-service caller -- the inserted row must be
+  -- attributed to the member's OWN JWT identity, never the one they
+  -- passed. This is the exact forged-reveal-audit-row attack AP7.2 closes.
+  PERFORM set_config('request.jwt.claims', jsonb_build_object('email', member_admin_email, 'role', 'authenticated')::text, true);
+  SET LOCAL ROLE authenticated;
+  logged_row := public.log_admin_action(
+    'ap7_forged_actor_attempt', 'users', 'some-user-id', NULL, NULL,
+    true, 'phone', 'some-user-id',
+    owner_admin_id, owner_email
+  );
   RESET ROLE;
-  IF logged_row.id IS NULL THEN
-    RAISE EXCEPTION 'FAIL: log_admin_action as service_role did not return an inserted row';
+  IF logged_row.actor_email = owner_email OR logged_row.actor_admin_id = owner_admin_id THEN
+    RAISE EXCEPTION 'FAIL: a member admin''s forged actor override was honoured -- row attributed to %/%, expected the member''s own identity', logged_row.actor_email, logged_row.actor_admin_id;
   END IF;
-  RAISE NOTICE 'PASS: log_admin_action raises KITPAT_ADMIN_ONLY for a non-admin, succeeds for an active admin called directly with role=authenticated (AP7.1), and still succeeds as service_role';
+  IF logged_row.actor_email <> member_admin_email THEN
+    RAISE EXCEPTION 'FAIL: log_admin_action (member admin, forged override) resolved actor_email=%, expected the member''s own %', logged_row.actor_email, member_admin_email;
+  END IF;
+
+  -- 0e. anon must not hold EXECUTE on log_admin_action (REVOKE ALL FROM
+  -- PUBLIC alone does not remove Supabase's own default grant to anon).
+  SELECT has_function_privilege(
+    'anon',
+    'public.log_admin_action(text,text,text,jsonb,jsonb,boolean,text,text,uuid,text)',
+    'EXECUTE'
+  ) INTO anon_has_execute;
+  IF anon_has_execute IS NOT false THEN
+    RAISE EXCEPTION 'FAIL: anon holds EXECUTE on log_admin_action, expected it revoked';
+  END IF;
+
+  RAISE NOTICE 'PASS: log_admin_action succeeds for an active admin called directly (own identity) and for service_role (honouring its override), rejects a non-admin, rejects a member admin''s forged actor override (attributing the row to the member instead), and anon has no EXECUTE privilege';
 
   --------------------------------------------------- 1. KITPAT_ADMIN_ONLY / role gate
   PERFORM set_config('request.jwt.claims', jsonb_build_object('email', non_admin_email, 'role', 'authenticated')::text, true);
