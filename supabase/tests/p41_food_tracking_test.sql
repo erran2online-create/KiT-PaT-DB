@@ -26,6 +26,9 @@
 --   e. delete_food_entry raises KITPAT_NOT_FOUND for a non-owner.
 --   f. anon holds no EXECUTE on the three new functions and no privilege
 --      (SELECT/INSERT/DELETE) on food_entries.
+--   g. ai_usage_log exists, RLS on, owner-only SELECT, anon has no
+--      privilege at all.
+--   h. A second member cannot read another member's ai_usage_log rows.
 
 BEGIN;
 
@@ -41,6 +44,7 @@ DECLARE
   row_rec record;
   visible_count integer;
   anon_priv boolean;
+  usage_log_id uuid;
 BEGIN
   ------------------------------------------------------------------ fixtures
   INSERT INTO public.users (name, phone, city) VALUES ('P41 User A', '9966000001', 'Chennai') RETURNING id INTO user_a;
@@ -171,6 +175,42 @@ BEGIN
     RAISE EXCEPTION 'FAIL: anon holds DELETE on public.food_entries';
   END IF;
   RAISE NOTICE 'PASS: anon holds no EXECUTE on the three new functions and no privilege on food_entries';
+
+  ------------------------------------------------------------ g. ai_usage_log shape
+  -- Only service_role writes this table (no client INSERT policy at
+  -- all), so the fixture row is inserted directly, as the edge function
+  -- itself would via its service_role client.
+  INSERT INTO public.ai_usage_log (user_id, feature, provider, model, succeeded)
+  VALUES (user_a, 'food_analysis', 'anthropic', 'claude-haiku-4-5-20251001', true)
+  RETURNING id INTO usage_log_id;
+
+  SET LOCAL ROLE authenticated;
+  PERFORM set_config('request.jwt.claims', jsonb_build_object('sub', user_a::text, 'role', 'authenticated')::text, true);
+  SELECT count(*) INTO visible_count FROM public.ai_usage_log WHERE id = usage_log_id;
+  RESET ROLE;
+  IF visible_count <> 1 THEN
+    RAISE EXCEPTION 'FAIL: user_a (the owner) could not read their own ai_usage_log row (count=%)', visible_count;
+  END IF;
+
+  SELECT has_table_privilege('anon', 'public.ai_usage_log', 'SELECT') INTO anon_priv;
+  IF anon_priv IS NOT false THEN
+    RAISE EXCEPTION 'FAIL: anon holds SELECT on public.ai_usage_log';
+  END IF;
+  SELECT has_table_privilege('anon', 'public.ai_usage_log', 'INSERT') INTO anon_priv;
+  IF anon_priv IS NOT false THEN
+    RAISE EXCEPTION 'FAIL: anon holds INSERT on public.ai_usage_log';
+  END IF;
+  RAISE NOTICE 'PASS: ai_usage_log exists with RLS on, owner-only SELECT, and anon has no privilege on it at all';
+
+  -------------------------------------------------- h. ai_usage_log is per-owner
+  SET LOCAL ROLE authenticated;
+  PERFORM set_config('request.jwt.claims', jsonb_build_object('sub', user_b::text, 'role', 'authenticated')::text, true);
+  SELECT count(*) INTO visible_count FROM public.ai_usage_log WHERE id = usage_log_id;
+  RESET ROLE;
+  IF visible_count <> 0 THEN
+    RAISE EXCEPTION 'FAIL: user_b could read user_a''s ai_usage_log row (count=%), expected 0', visible_count;
+  END IF;
+  RAISE NOTICE 'PASS: a second member cannot read another member''s ai_usage_log rows';
 
   RAISE NOTICE 'ALL ASSERTIONS PASSED';
   RAISE NOTICE 'NOTE: the analyze-food edge function itself was NOT tested here -- not SQL-testable.';

@@ -19,12 +19,30 @@
 // the live plans rows: Free 10, Starter 50, Queen 500, Empress -1).
 // -1 means unlimited, the same convention used by every other key in
 // limits (max_parties_per_month, max_groups, ...) -- never enforced.
-// Usage is counted directly from food_entries (no separate counter
-// table): rows for this user, this UTC calendar month, with
-// ai_provider IS NOT NULL -- an AI call is what created the entry. If the
-// limits lookup is missing the key or fails outright, this function FAILS
-// OPEN (proceeds, logs server-side) -- a broken limits lookup must never
-// block a paying member from using a feature they're entitled to.
+//
+// P41.1: usage is counted from public.ai_usage_log (succeeded = true rows
+// for this user, this UTC calendar month), NOT from food_entries.
+// food_entries can't work as the signal: analyze-food deliberately
+// returns the estimate WITHOUT saving it, so the member can adjust or
+// discard before record_food_entry ever runs (kept unchanged -- it's the
+// right design) -- which means a member who never saves would never be
+// counted, and the cap would be unenforceable while the provider bill
+// stayed uncapped. Instead:
+//   - The count check runs BEFORE calling the provider, so a member over
+//     their cap never triggers a billable request.
+//   - One ai_usage_log row is written per actual provider call this
+//     function makes (via sbService, after the provider responds --
+//     succeeded reflects whether we got an HTTP response at all, i.e.
+//     whether the call was actually billable, independent of whether the
+//     response text then parsed into usable macros). A network/HTTP-level
+//     failure (succeeded=false, "our outage") is logged but never counted
+//     against the member's cap; an unparseable-but-received response
+//     (succeeded=true, the provider still billed us for that request) is
+//     counted even though the member gets KITPAT_AI_UNAVAILABLE back.
+// If the limits lookup is missing the key or fails outright, this
+// function FAILS OPEN (proceeds, logs server-side) -- a broken limits
+// lookup must never block a paying member from using a feature they're
+// entitled to.
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
 
@@ -124,6 +142,20 @@ async function callAnthropic(prompt: string): Promise<string | null> {
   return typeof text === "string" ? text : null
 }
 
+/** Best-effort: never lets a logging failure break the actual request. */
+async function logUsage(
+  sbService: ReturnType<typeof createClient>,
+  userId: string,
+  provider: string,
+  model: string,
+  succeeded: boolean,
+): Promise<void> {
+  const { error } = await sbService
+    .from("ai_usage_log")
+    .insert({ user_id: userId, feature: "food_analysis", provider, model, succeeded })
+  if (error) console.error("analyze-food: failed to write ai_usage_log", { userId, provider, succeeded, error })
+}
+
 async function callOpenAI(prompt: string): Promise<string | null> {
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -188,10 +220,11 @@ serve(async (req) => {
       } else if (limit !== -1) {
         const startOfMonth = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1)).toISOString()
         const { count, error: countErr } = await sbService
-          .from("food_entries")
+          .from("ai_usage_log")
           .select("id", { count: "exact", head: true })
           .eq("user_id", user.id)
-          .not("ai_provider", "is", null)
+          .eq("feature", "food_analysis")
+          .eq("succeeded", true)
           .gte("created_at", startOfMonth)
         if (countErr) {
           console.error("analyze-food: usage count failed, failing open", { userId: user.id, countErr })
@@ -205,8 +238,17 @@ serve(async (req) => {
     const provider: "anthropic" | "openai" | null = ANTHROPIC_API_KEY ? "anthropic" : OPENAI_API_KEY ? "openai" : null
     if (!provider) return fail("KITPAT_AI_NOT_CONFIGURED", 503)
 
+    const model = provider === "anthropic" ? ANTHROPIC_MODEL : OPENAI_MODEL
     const prompt = buildPrompt(description, serving)
     const raw = provider === "anthropic" ? await callAnthropic(prompt) : await callOpenAI(prompt)
+
+    // Written AFTER the provider responds (or fails to), exactly once per
+    // actual call this function makes -- see this file's header for why
+    // succeeded reflects "did we get an HTTP response" (billable),
+    // independent of whether that response then parsed into usable
+    // macros.
+    await logUsage(sbService, user.id, provider, model, raw !== null)
+
     if (raw === null) return fail("KITPAT_AI_UNAVAILABLE", 502)
 
     const macros = parseMacros(raw)
@@ -224,7 +266,7 @@ serve(async (req) => {
       serving: macros.serving ?? serving,
       confidence: macros.confidence,
       ai_provider: provider,
-      ai_model: provider === "anthropic" ? ANTHROPIC_MODEL : OPENAI_MODEL,
+      ai_model: model,
     })
   } catch (e) {
     console.error("analyze-food: unhandled error", e)

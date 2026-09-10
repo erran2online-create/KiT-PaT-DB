@@ -17,6 +17,18 @@
 -- so the two enforcement paths (a direct client write and the RPC) can
 -- never drift apart. No UPDATE policy or RPC: an entry is corrected by
 -- deleting and re-adding.
+--
+-- P41.1 UPDATE -- the original ai_calls_per_month enforcement (counting
+-- from food_entries.ai_provider IS NOT NULL) cannot work: analyze-food
+-- deliberately returns the estimate WITHOUT persisting it, so the member
+-- can adjust or discard before record_food_entry ever runs (kept
+-- unchanged -- it is the right design). That means a member who never
+-- saves is never counted, and the cap becomes unenforceable while the
+-- provider bill stays uncapped. Fixed by adding public.ai_usage_log,
+-- written by analyze-food itself (service_role) once per actual provider
+-- call, independent of whether the member goes on to save anything.
+-- Enforcement now counts from ai_usage_log (succeeded = true), not
+-- food_entries -- see analyze-food's own header for the full mechanics.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE public.food_entries (
@@ -260,3 +272,45 @@ COMMENT ON FUNCTION public.delete_food_entry(uuid) IS
 REVOKE ALL ON FUNCTION public.delete_food_entry(uuid) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.delete_food_entry(uuid) FROM anon;
 GRANT EXECUTE ON FUNCTION public.delete_food_entry(uuid) TO authenticated, service_role;
+
+-- ---------------------------------------------------------------------------
+-- P41.1: ai_usage_log -- one row per actual provider call analyze-food
+-- makes, written by its own service_role client, independent of whether
+-- the member goes on to save a food_entries row at all. This is what
+-- ai_calls_per_month is enforced against; a food_entries row (only
+-- created if the member chooses to save) is no longer the signal.
+--
+-- No client write path of any kind -- only analyze-food's service_role
+-- client ever inserts here. A member may only ever read their own rows,
+-- and only via a direct SELECT (no RPC needed for that).
+-- ---------------------------------------------------------------------------
+CREATE TABLE public.ai_usage_log (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  feature text NOT NULL,
+  provider text NOT NULL,
+  model text,
+  succeeded boolean NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT ai_usage_log_provider_check CHECK (provider IN ('openai', 'anthropic'))
+);
+
+COMMENT ON TABLE public.ai_usage_log IS
+  'One row per actual AI provider call (feature=''food_analysis'' for analyze-food), written only by service_role. This is what plans.limits.ai_calls_per_month is enforced against -- counted independent of whether the call''s output was ever saved via record_food_entry. succeeded=false rows are logged (a failed call still cost a provider request) but never counted against a member''s cap.';
+
+CREATE INDEX idx_ai_usage_log_user_created ON public.ai_usage_log (user_id, created_at);
+
+ALTER TABLE public.ai_usage_log ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS ai_usage_log_select_own ON public.ai_usage_log;
+CREATE POLICY ai_usage_log_select_own ON public.ai_usage_log
+  FOR SELECT TO authenticated
+  USING (user_id = auth.uid());
+
+-- Deliberately no INSERT/UPDATE/DELETE policy of any kind: only
+-- service_role (exempt from RLS by role attribute) ever writes this
+-- table, from analyze-food.
+
+REVOKE ALL ON public.ai_usage_log FROM anon;
+GRANT SELECT ON public.ai_usage_log TO authenticated;
+GRANT ALL ON public.ai_usage_log TO service_role;
