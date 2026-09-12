@@ -28,12 +28,15 @@
 --      columns, confirm_phone_change, confirm_email_verification), and
 --      authenticated cannot call either confirm_* RPC directly either
 --      (service_role only).
+--   f. users.phone_sync_pending (P43.1 reconciliation flag) exists, is
+--      nullable, defaults NULL, and anon has no privilege on it.
 --   (extra, beyond the letter of the task but load-bearing for the whole
 --   feature's actual security): the new BEFORE UPDATE trigger blocks a
---   direct client update to users.phone or users.email_verified_at, and
---   confirm_phone_change/confirm_email_verification -- called via
---   service_role, exactly as each edge function calls them -- correctly
---   perform the swap end to end including the race-guard re-check.
+--   direct client update to users.phone, users.email_verified_at, or
+--   users.phone_sync_pending, and confirm_phone_change/
+--   confirm_email_verification -- called via service_role, exactly as
+--   each edge function calls them -- correctly perform the swap end to
+--   end including the race-guard re-check.
 
 BEGIN;
 
@@ -122,6 +125,23 @@ BEGIN
   END IF;
   RAISE NOTICE 'PASS: anon holds no privilege on anything new, and authenticated cannot call either confirm_* RPC directly';
 
+  --------------------------------------------------- f. phone_sync_pending column
+  SELECT column_name, is_nullable, column_default INTO col
+  FROM information_schema.columns
+  WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'phone_sync_pending';
+  IF col.column_name IS NULL THEN
+    RAISE EXCEPTION 'FAIL: users.phone_sync_pending does not exist';
+  END IF;
+  IF col.is_nullable <> 'YES' OR col.column_default IS NOT NULL THEN
+    RAISE EXCEPTION 'FAIL: users.phone_sync_pending is_nullable=%, default=%, expected nullable with no default', col.is_nullable, col.column_default;
+  END IF;
+
+  SELECT has_table_privilege('anon', 'public.users', 'SELECT') INTO anon_priv;
+  IF anon_priv IS NOT false THEN
+    RAISE EXCEPTION 'FAIL: anon holds SELECT on public.users (would include phone_sync_pending)';
+  END IF;
+  RAISE NOTICE 'PASS: users.phone_sync_pending exists, is nullable, defaults to NULL, and anon has no privilege on it';
+
   ------------------------------------------- extra: the guard trigger is load-bearing
   SET LOCAL ROLE authenticated;
   PERFORM set_config('request.jwt.claims', jsonb_build_object('sub', user_a::text, 'role', 'authenticated')::text, true);
@@ -144,8 +164,30 @@ BEGIN
       RAISE EXCEPTION 'FAIL: direct email_verified_at UPDATE raised "%", expected KITPAT_EMAIL_VERIFICATION_REQUIRES_OTP', err;
     END IF;
   END;
+
+  BEGIN
+    UPDATE public.users SET phone_sync_pending = 'forged' WHERE id = user_a;
+    RAISE EXCEPTION 'FAIL: a direct client UPDATE set users.phone_sync_pending -- it must be system-managed only';
+  EXCEPTION WHEN OTHERS THEN
+    err := SQLERRM;
+    IF err <> 'KITPAT_PHONE_SYNC_STATE_IS_SYSTEM_MANAGED' THEN
+      RAISE EXCEPTION 'FAIL: direct phone_sync_pending UPDATE raised "%", expected KITPAT_PHONE_SYNC_STATE_IS_SYSTEM_MANAGED', err;
+    END IF;
+  END;
   RESET ROLE;
-  RAISE NOTICE 'PASS: the guard trigger blocks a direct client UPDATE to phone or email_verified_at';
+  RAISE NOTICE 'PASS: the guard trigger blocks a direct client UPDATE to phone, email_verified_at, or phone_sync_pending';
+
+  -- service_role, in contrast, may set and clear it freely -- exactly
+  -- what change-phone's own service_role client does.
+  SET LOCAL ROLE service_role;
+  PERFORM set_config('request.jwt.claims', jsonb_build_object('role', 'service_role')::text, true);
+  UPDATE public.users SET phone_sync_pending = 'auth_sync_failed_at:test' WHERE id = user_a;
+  UPDATE public.users SET phone_sync_pending = NULL WHERE id = user_a;
+  RESET ROLE;
+  IF (SELECT phone_sync_pending FROM public.users WHERE id = user_a) IS NOT NULL THEN
+    RAISE EXCEPTION 'FAIL: service_role could not set/clear phone_sync_pending';
+  END IF;
+  RAISE NOTICE 'PASS: service_role may set and clear phone_sync_pending';
 
   ---------------------------------------------- extra: confirm_phone_change end to end
   otp_id := gen_random_uuid();

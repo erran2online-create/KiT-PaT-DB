@@ -48,6 +48,23 @@
 -- Section 3 below closes it with a BEFORE UPDATE trigger, the one
 -- enforcement point that applies regardless of which code path performs
 -- the UPDATE.
+--
+-- P43.1 UPDATE -- verified against the live database and against
+-- verify-otp/index.ts: sign-in does NOT use auth.users.phone at all. It
+-- mints a session from a SYNTHETIC EMAIL derived from the phone
+-- (phoneEmail(p) = `${p}@phone.kitpat.local`), via
+-- admin.generateLink({type:'magiclink', email}). Live data confirmed the
+-- shape for all 53 users: auth.users.email is what actually signs a
+-- member in; auth.users.phone is set but not read by that path.
+-- change-phone's confirm action already updated BOTH phone and email
+-- together in its one auth.admin.updateUserById call (this was correct
+-- from the first version of this migration) -- what was still missing is
+-- what happens if that ADMIN API CALL ITSELF FAILS after the SQL swap
+-- already committed. users.phone_sync_pending (section 1b) makes that
+-- failure visible and reconcilable instead of a silent, permanent
+-- mismatch. See change-phone/index.ts's own header for the full traced
+-- failure-mode analysis (what a member CAN and CANNOT still do while this
+-- flag is set) and this PR's description for the exact recovery runbook.
 -- ---------------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------------
@@ -59,6 +76,26 @@ ALTER TABLE public.users
 
 COMMENT ON COLUMN public.users.email_verified_at IS
   'Set only by confirm_email_verification (service_role only, via verify-email). NULL = unverified (email may still be set and shown). A BEFORE UPDATE trigger (public.users_guard_identity_columns) blocks any non-service_role attempt to set this directly, and auto-clears it if email changes without also setting a fresh verified_at in the same statement.';
+
+-- ---------------------------------------------------------------------------
+-- 1b. users.phone_sync_pending (P43.1) -- reconciliation flag for the one
+--     step of change-phone's confirm action that cannot be part of the
+--     SQL transaction: syncing auth.users.phone/email to match the
+--     public.users.phone this migration's confirm_phone_change already
+--     swapped. NULL = in sync (the normal case). Non-NULL = the last
+--     auth.admin.updateUserById call failed after the SQL swap already
+--     committed; a short diagnostic string (reason + timestamp) is
+--     stored, not just a boolean, so an admin reading this row directly
+--     doesn't have to go hunting through function logs to know when/why.
+--     Set and cleared only by change-phone's service_role client -- the
+--     same BEFORE UPDATE trigger that protects phone/email_verified_at
+--     (extended in section 3 below) protects this column too.
+-- ---------------------------------------------------------------------------
+ALTER TABLE public.users
+  ADD COLUMN IF NOT EXISTS phone_sync_pending text;
+
+COMMENT ON COLUMN public.users.phone_sync_pending IS
+  'NULL = auth.users is in sync with this row''s phone (the normal case). Non-NULL = change-phone''s auth.admin.updateUserById call failed after public.users.phone was already swapped -- holds a short diagnostic string. Recovery: re-run auth.admin.updateUserById(id, {phone: ''+91''||users.phone, email: users.phone||''@phone.kitpat.local'', phone_confirm:true, email_confirm:true}) using this row''s CURRENT phone, then clear this column to NULL. See this migration''s P43.1 header and the P43 PR description for the full runbook. Guarded by the same BEFORE UPDATE trigger as phone/email_verified_at -- only service_role may set or clear it.';
 
 -- ---------------------------------------------------------------------------
 -- 2. otp_verification -- purpose + user_id + email, phone relaxed to
@@ -144,6 +181,9 @@ BEGIN
     IF NEW.email_verified_at IS DISTINCT FROM OLD.email_verified_at THEN
       RAISE EXCEPTION 'KITPAT_EMAIL_VERIFICATION_REQUIRES_OTP' USING ERRCODE = 'PT403';
     END IF;
+    IF NEW.phone_sync_pending IS DISTINCT FROM OLD.phone_sync_pending THEN
+      RAISE EXCEPTION 'KITPAT_PHONE_SYNC_STATE_IS_SYSTEM_MANAGED' USING ERRCODE = 'PT403';
+    END IF;
   END IF;
 
   -- email changed without also setting a fresh verified_at in the same
@@ -161,7 +201,7 @@ END;
 $$;
 
 COMMENT ON FUNCTION public.users_guard_identity_columns() IS
-  'BEFORE UPDATE on public.users. Blocks changing phone or email_verified_at unless the caller is service_role (auth.role()); auto-clears email_verified_at whenever email changes without the same statement also setting a fresh verified_at, so a stale verification can never survive an email edit.';
+  'BEFORE UPDATE on public.users. Blocks changing phone, email_verified_at, or phone_sync_pending unless the caller is service_role (auth.role()); auto-clears email_verified_at whenever email changes without the same statement also setting a fresh verified_at, so a stale verification can never survive an email edit.';
 
 DROP TRIGGER IF EXISTS users_guard_identity_columns_trigger ON public.users;
 CREATE TRIGGER users_guard_identity_columns_trigger
