@@ -17,20 +17,33 @@
 --   KITPAT_NOT_MEMBER (PT403, caller/target recognized as neither member
 --   nor host).
 --
--- ONE deliberate departure from that reuse, flagged rather than silently
--- done: the task's own explicit instruction (both its "at minimum" list
--- and its test assertions) names KITPAT_INSUFFICIENT_ROLE for
--- record_contribution/record_expense's host-only rejection, not this
--- domain's existing KITPAT_NOT_HOST (used by set_pool_expected and
--- void_contribution/void_kitty_expense for the identical "caller is not
--- the host" condition). KITPAT_INSUFFICIENT_ROLE is not a new invention --
--- it already exists in this codebase's vocabulary (the admin-surface RPCs,
--- e.g. admin_can_write, admin_void_ledger_entry) -- but it is a different
--- name than this specific function family has used for the same concept
--- until now. Followed the task's explicit instruction over the general
--- "match this domain's own names" principle, since it names the exact
--- code twice, explicitly. Worth a second look if KITPAT_NOT_HOST was
--- actually intended for consistency with set_pool_expected/void_*.
+-- P44.1 CORRECTION: the first version of this migration used
+-- KITPAT_INSUFFICIENT_ROLE for both functions' role rejection, per an
+-- earlier instruction. That instruction was wrong and has been corrected,
+-- verified live: KITPAT_INSUFFICIENT_ROLE is an admin-domain code (5 uses,
+-- all in AP-series admin RPCs) with ZERO handling anywhere in the member
+-- frontend -- a member hitting it would get a generic, untranslated error.
+-- KITPAT_INSUFFICIENT_ROLE is REMOVED from both functions entirely.
+-- Corrected to this domain's own, already-frontend-handled codes:
+--   KITPAT_NOT_HOST   -- src/parties/api.ts:445 (7 live uses: set_pool_
+--                        expected, void_contribution, void_kitty_expense)
+--   KITPAT_NOT_MEMBER -- src/kitty/api.ts:34, "kitty.error.notmember"
+--                        (2 live uses, including get_kitty_balance)
+--
+-- record_contribution's three-way permission split:
+--   - caller is not a member of pool.group_id at all -> KITPAT_NOT_MEMBER
+--   - caller IS a member but p_user_id is someone else, and caller is not
+--     the host -> KITPAT_NOT_HOST
+--   - p_user_id = auth.uid() and caller is a member -> ALLOW
+-- A host is checked FIRST and always allowed regardless of target (self or
+-- any other member), exactly as before this feature existed -- none of the
+-- three bullets above ever apply to a host, since is_group_host is
+-- unconditional and short-circuits ahead of them.
+--
+-- record_expense: unchanged host-only permission, now raising KITPAT_NOT_HOST
+-- (reverted from the incorrect KITPAT_INSUFFICIENT_ROLE) rather than a
+-- brand new code -- the exact code set_pool_expected/void_* already use for
+-- the identical "caller is not the host" condition.
 --
 -- The "target user is not a member or host of this group" check inside
 -- record_contribution (unchanged logic, only its message converted) reuses
@@ -79,15 +92,20 @@ BEGIN
     RAISE EXCEPTION 'KITPAT_NOT_FOUND' USING ERRCODE = 'PT404';
   END IF;
 
-  -- A member may always record her own contribution. Recording against
-  -- anyone else stays host-only -- is_group_host is still checked
-  -- unconditionally here, so a host recording for themselves or for
-  -- another member both continue to work exactly as before.
-  IF NOT (
-    (p_user_id = uid AND public.is_group_member(pool.group_id, uid))
-    OR public.is_group_host(pool.group_id, uid)
-  ) THEN
-    RAISE EXCEPTION 'KITPAT_INSUFFICIENT_ROLE' USING ERRCODE = 'PT403';
+  -- Host: allowed regardless of target (self or any other member), exactly
+  -- as before this feature existed. Checked first so none of the three
+  -- cases below ever apply to a host.
+  IF NOT public.is_group_host(pool.group_id, uid) THEN
+    IF p_user_id = uid AND public.is_group_member(pool.group_id, uid) THEN
+      -- A member recording her own contribution -- allowed.
+      NULL;
+    ELSIF NOT public.is_group_member(pool.group_id, uid) THEN
+      RAISE EXCEPTION 'KITPAT_NOT_MEMBER' USING ERRCODE = 'PT403';
+    ELSE
+      -- Caller is a member, but is trying to record against someone else
+      -- without being the host.
+      RAISE EXCEPTION 'KITPAT_NOT_HOST' USING ERRCODE = 'PT403';
+    END IF;
   END IF;
 
   IF NOT public.is_group_member(pool.group_id, p_user_id)
@@ -113,7 +131,7 @@ END;
 $$;
 
 COMMENT ON FUNCTION public.record_contribution(uuid, uuid, numeric, text, text, uuid) IS
-  'A member may record her own contribution (p_user_id = auth.uid() and a group member); recording against any other user stays host-only. Amount is numeric(12,2) end to end: no rounding to whole rupees. Errors: KITPAT_UNAUTHENTICATED / KITPAT_INVALID_AMOUNT / KITPAT_NOT_FOUND / KITPAT_INSUFFICIENT_ROLE / KITPAT_NOT_MEMBER.';
+  'A member may record her own contribution (p_user_id = auth.uid() and a group member); recording against any other user stays host-only. Amount is numeric(12,2) end to end: no rounding to whole rupees. Errors: KITPAT_UNAUTHENTICATED / KITPAT_INVALID_AMOUNT / KITPAT_NOT_FOUND / KITPAT_NOT_MEMBER (caller, or the target, is not recognized as part of the group) / KITPAT_NOT_HOST (a non-host caller tried to record against someone else).';
 
 -- ---------------------------------------------------------------------------
 -- 2. record_expense -- host-only, unchanged permission logic. Only its
@@ -148,7 +166,7 @@ BEGIN
     RAISE EXCEPTION 'KITPAT_NOT_FOUND' USING ERRCODE = 'PT404';
   END IF;
   IF NOT public.is_group_host(pool.group_id, uid) THEN
-    RAISE EXCEPTION 'KITPAT_INSUFFICIENT_ROLE' USING ERRCODE = 'PT403';
+    RAISE EXCEPTION 'KITPAT_NOT_HOST' USING ERRCODE = 'PT403';
   END IF;
 
   INSERT INTO public.kitty_expenses (
@@ -168,7 +186,7 @@ END;
 $$;
 
 COMMENT ON FUNCTION public.record_expense(uuid, numeric, text, text, uuid, text) IS
-  'Host-only, unchanged from before this migration -- only its exception messages are now stable codes. Amount is numeric(12,2) end to end: no rounding to whole rupees. Errors: KITPAT_UNAUTHENTICATED / KITPAT_INVALID_AMOUNT / KITPAT_NOT_FOUND / KITPAT_INSUFFICIENT_ROLE.';
+  'Host-only, unchanged from before this migration -- only its exception messages are now stable codes. Amount is numeric(12,2) end to end: no rounding to whole rupees. Errors: KITPAT_UNAUTHENTICATED / KITPAT_INVALID_AMOUNT / KITPAT_NOT_FOUND / KITPAT_NOT_HOST.';
 
 -- No GRANT/REVOKE statements here, deliberately: "do not change grants".
 -- CREATE OR REPLACE FUNCTION with an identical signature does not alter a

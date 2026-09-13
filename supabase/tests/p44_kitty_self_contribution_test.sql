@@ -17,16 +17,16 @@
 --   a. A non-host member CAN record a contribution for herself, and the
 --      pool total re-settles correctly.
 --   b. The same member CANNOT record a contribution for another member --
---      KITPAT_INSUFFICIENT_ROLE.
+--      KITPAT_NOT_HOST (she is a member, just not the host).
 --   c. The host CAN still record against any member.
 --   d. An outsider (not in the group at all) CANNOT record anything, even
---      for herself -- KITPAT_INSUFFICIENT_ROLE.
---   e. record_expense still raises KITPAT_INSUFFICIENT_ROLE for a
---      non-host.
+--      for herself -- KITPAT_NOT_MEMBER.
+--   e. record_expense still raises KITPAT_NOT_HOST for a non-host.
 --   f. Both functions raise KITPAT_INVALID_AMOUNT for zero/negative
 --      amounts, and KITPAT_NOT_FOUND for a missing pool.
 --   g. Neither function body contains a remaining plain-English exception
---      string.
+--      string, or the string KITPAT_INSUFFICIENT_ROLE (removed in P44.1 --
+--      an admin-domain code with no member-frontend handling).
 
 BEGIN;
 
@@ -79,11 +79,11 @@ BEGIN
     RAISE EXCEPTION 'FAIL: a non-host member recorded a contribution for another member';
   EXCEPTION WHEN OTHERS THEN
     err := SQLERRM;
-    IF err <> 'KITPAT_INSUFFICIENT_ROLE' THEN
-      RAISE EXCEPTION 'FAIL: member-for-another record_contribution raised "%", expected KITPAT_INSUFFICIENT_ROLE', err;
+    IF err <> 'KITPAT_NOT_HOST' THEN
+      RAISE EXCEPTION 'FAIL: member-for-another record_contribution raised "%", expected KITPAT_NOT_HOST', err;
     END IF;
   END;
-  RAISE NOTICE 'PASS: a member cannot record a contribution for another member';
+  RAISE NOTICE 'PASS: a member cannot record a contribution for another member (KITPAT_NOT_HOST)';
 
   ------------------------------------------------- c. host can still record for anyone
   PERFORM set_config('request.jwt.claims', jsonb_build_object('sub', host_id::text, 'role', 'authenticated')::text, true);
@@ -100,11 +100,11 @@ BEGIN
     RAISE EXCEPTION 'FAIL: an outsider recorded a contribution for herself';
   EXCEPTION WHEN OTHERS THEN
     err := SQLERRM;
-    IF err <> 'KITPAT_INSUFFICIENT_ROLE' THEN
-      RAISE EXCEPTION 'FAIL: outsider self-record raised "%", expected KITPAT_INSUFFICIENT_ROLE', err;
+    IF err <> 'KITPAT_NOT_MEMBER' THEN
+      RAISE EXCEPTION 'FAIL: outsider self-record raised "%", expected KITPAT_NOT_MEMBER', err;
     END IF;
   END;
-  RAISE NOTICE 'PASS: a user who is not in the group at all cannot record anything, even for herself';
+  RAISE NOTICE 'PASS: a user who is not in the group at all cannot record anything, even for herself (KITPAT_NOT_MEMBER)';
 
   --------------------------------------------------- e. record_expense still host-only
   PERFORM set_config('request.jwt.claims', jsonb_build_object('sub', member_a_id::text, 'role', 'authenticated')::text, true);
@@ -113,11 +113,11 @@ BEGIN
     RAISE EXCEPTION 'FAIL: a non-host member recorded an expense';
   EXCEPTION WHEN OTHERS THEN
     err := SQLERRM;
-    IF err <> 'KITPAT_INSUFFICIENT_ROLE' THEN
-      RAISE EXCEPTION 'FAIL: non-host record_expense raised "%", expected KITPAT_INSUFFICIENT_ROLE', err;
+    IF err <> 'KITPAT_NOT_HOST' THEN
+      RAISE EXCEPTION 'FAIL: non-host record_expense raised "%", expected KITPAT_NOT_HOST', err;
     END IF;
   END;
-  RAISE NOTICE 'PASS: record_expense still raises KITPAT_INSUFFICIENT_ROLE for a non-host';
+  RAISE NOTICE 'PASS: record_expense still raises KITPAT_NOT_HOST for a non-host';
 
   ------------------------------------------------------- f. amount + not-found codes
   PERFORM set_config('request.jwt.claims', jsonb_build_object('sub', host_id::text, 'role', 'authenticated')::text, true);
@@ -199,6 +199,18 @@ BEGIN
     RAISE EXCEPTION 'FAIL: % plain-English exception string(s) remain in record_contribution/record_expense', bad_string_count;
   END IF;
   RAISE NOTICE 'PASS: no plain-English exception string remains in either function body';
+
+  ------------------------------------- g (extra). no KITPAT_INSUFFICIENT_ROLE remains
+  SELECT count(*) INTO bad_string_count
+  FROM pg_proc p
+  JOIN pg_namespace n ON n.oid = p.pronamespace
+  WHERE n.nspname = 'public'
+    AND p.proname IN ('record_contribution', 'record_expense')
+    AND p.prosrc LIKE '%KITPAT_INSUFFICIENT_ROLE%';
+  IF bad_string_count <> 0 THEN
+    RAISE EXCEPTION 'FAIL: KITPAT_INSUFFICIENT_ROLE (an admin-domain code with no member-frontend handling) still appears in record_contribution/record_expense';
+  END IF;
+  RAISE NOTICE 'PASS: neither function body contains KITPAT_INSUFFICIENT_ROLE';
 
   RAISE NOTICE 'ALL ASSERTIONS PASSED';
 END;
