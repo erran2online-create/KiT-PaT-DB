@@ -28,11 +28,24 @@
 // limits (max_parties_per_month, max_groups, ...) -- never enforced.
 //
 // Usage is counted from public.ai_usage_log (succeeded = true rows for
-// this user, this UTC calendar month, feature='food_analysis'), NOT from
-// food_entries -- food_entries can't work as the signal, since this
-// function deliberately returns the estimate WITHOUT saving it, so a
-// member who never calls record_food_entry would never be counted. The
-// count check runs on whichever path will actually call the provider:
+// this user, this UTC calendar month), NOT from food_entries -- food_
+// entries can't work as the signal, since this function deliberately
+// returns the estimate WITHOUT saving it, so a member who never calls
+// record_food_entry would never be counted.
+//
+// P46.1 CORRECTION: the count is NOT filtered by feature. ai_calls_per_
+// month is one shared total across every AI feature this member uses
+// (food_analysis here, recipe_lookup in get-recipe, ...) -- verified live,
+// it reads as a total, not a per-feature allowance. The original version
+// of this function filtered the count to feature='food_analysis' only,
+// which combined with get-recipe's own (also-fixed) per-feature count
+// meant a Free member got 10 food lookups AND 10 recipe lookups against a
+// limit that says 10. The ai_usage_log row this function writes below
+// still tags feature='food_analysis' -- only the COUNT query's filter is
+// dropped, since that tag is what lets admin_ai_usage_summary (AP12) tell
+// food from recipe spend apart.
+//
+// The count check runs on whichever path will actually call the provider:
 // always for an image request (there is no cache for images), or only on
 // a cache MISS for a text request (a cache hit costs nothing and must
 // never count against the cap). Check runs BEFORE calling the provider,
@@ -326,11 +339,17 @@ serve(async (req) => {
         console.error("analyze-food: plans.limits has no ai_calls_per_month key, failing open", { userId: user.id, limits })
       } else if (limit !== -1) {
         const startOfMonth = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1)).toISOString()
+        // P46.1: counts ALL of the caller's succeeded ai_usage_log rows this
+        // month, regardless of feature -- ai_calls_per_month is one shared
+        // total across every AI feature (food_analysis, recipe_lookup, ...),
+        // not a separate budget per feature. The row this function writes
+        // below still tags feature='food_analysis' -- that's what lets the
+        // admin AI-usage view (admin_ai_usage_summary, AP12) tell food from
+        // recipe spend apart; only the COUNT query's filter is dropped.
         const { count, error: countErr } = await sbService
           .from("ai_usage_log")
           .select("id", { count: "exact", head: true })
           .eq("user_id", user.id)
-          .eq("feature", "food_analysis")
           .eq("succeeded", true)
           .gte("created_at", startOfMonth)
         if (countErr) {
