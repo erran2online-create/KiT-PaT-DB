@@ -6,7 +6,7 @@
 -- Self-contained and non-destructive: everything happens inside one
 -- transaction that is ROLLED BACK at the end, so it can be run against any
 -- database that already has this migration
--- (20260915010000_p46_1_recipe_matching.sql) applied.
+-- (20260915030000_p46_1_recipe_matching.sql) applied.
 --
 --   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f supabase/tests/p46_1_recipe_matching_test.sql
 --
