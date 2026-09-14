@@ -10,12 +10,20 @@
 //
 // Plan limit: exactly analyze-food's mechanism (same ai_calls_per_month
 // key from plans.limits, same fail-open-on-a-broken-lookup behaviour, same
-// -1-is-unlimited convention), with feature='recipe_lookup' in place of
-// 'food_analysis'. This is a literal, direct mirror -- recipe_lookup gets
-// its own independent monthly counter under the same numeric cap, not a
-// budget shared with food_analysis, exactly as analyze-food's own count
-// query is scoped to one feature string. input_kind is always 'text' (no
-// image path exists for a recipe lookup).
+// -1-is-unlimited convention). input_kind is always 'text' (no image path
+// exists for a recipe lookup).
+//
+// P46.1 CORRECTION: the count is SHARED with food_analysis, not a separate
+// per-feature budget. ai_calls_per_month is one admin-set total across
+// every AI feature a member uses -- verified live (Free 10, Starter 50,
+// Queen 500, Empress -1/unlimited), it reads as a total. The original
+// version of this function counted only feature='recipe_lookup' rows,
+// which combined with analyze-food's own (also-fixed) per-feature count
+// meant a Free member got 10 food lookups AND 10 recipe lookups against a
+// limit that says 10. The ai_usage_log row this function writes below
+// still tags feature='recipe_lookup' -- only the COUNT query's filter is
+// dropped, since that tag is what lets admin_ai_usage_summary (AP12) tell
+// food from recipe spend apart.
 //
 // The provider is asked for JSON only: {title, cuisine, serves,
 // prep_minutes, cook_minutes, ingredients:[{item,quantity}], steps:[...],
@@ -224,11 +232,12 @@ serve(async (req) => {
         console.error("get-recipe: plans.limits has no ai_calls_per_month key, failing open", { userId: user.id, limits })
       } else if (limit !== -1) {
         const startOfMonth = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1)).toISOString()
+        // Not filtered by feature -- shared with analyze-food's own count,
+        // see this file's header.
         const { count, error: countErr } = await sbService
           .from("ai_usage_log")
           .select("id", { count: "exact", head: true })
           .eq("user_id", user.id)
-          .eq("feature", "recipe_lookup")
           .eq("succeeded", true)
           .gte("created_at", startOfMonth)
         if (countErr) {
