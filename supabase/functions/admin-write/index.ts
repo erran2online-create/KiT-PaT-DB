@@ -41,6 +41,30 @@ function fail(code: string, status: number) {
   return json({ error: code }, status)
 }
 
+type PgErrorLike = { code?: string | null; message?: string | null; details?: string | null; hint?: string | null } | null
+
+/**
+ * AP17: the ONE place a failed database call is turned into a response.
+ * Logs the FULL Postgres error server-side (code/message/details/hint,
+ * table, op, and payload KEY NAMES ONLY -- never values, which may carry
+ * plan pricing or member data) via console.error so it reaches dashboard
+ * logs, then returns a client-safe body carrying just the 5-character
+ * SQLSTATE alongside the existing KITPAT_* code -- never message/details/
+ * hint, since those can contain row values.
+ */
+function failDb(logMessage: string, clientCode: string, status: number, err: PgErrorLike, table: string, op: string, payload?: Record<string, unknown> | null) {
+  console.error(`admin-write: ${logMessage}`, {
+    table,
+    op,
+    payload_keys: payload ? Object.keys(payload) : null,
+    pg_code: err?.code ?? null,
+    pg_message: err?.message ?? null,
+    pg_details: err?.details ?? null,
+    pg_hint: err?.hint ?? null,
+  })
+  return json({ error: clientCode, pg_code: err?.code ?? null }, status)
+}
+
 // The 7 admin-editable content tables, and the column each is actually
 // keyed by. tambola_variants is the one exception in this set: its
 // primary key is `key` (text), not `id` -- every other table here uses a
@@ -85,6 +109,7 @@ serve(async (req) => {
       .select("id, role, is_active")
       .eq("email", user.email)
       .maybeSingle()
+    if (adminErr) console.error("admin-write: admins lookup failed", { pg_code: adminErr.code, pg_message: adminErr.message, pg_details: adminErr.details, pg_hint: adminErr.hint })
     if (adminErr || !adminRow || !adminRow.is_active) return fail("KITPAT_ADMIN_ONLY", 403)
 
     const body = (await req.json().catch(() => ({}))) as Record<string, unknown>
@@ -113,6 +138,7 @@ serve(async (req) => {
       global: { headers: { Authorization: `Bearer ${token}` } },
     })
     const { data: canWrite, error: canWriteErr } = await sbUser.rpc("admin_can_write", { p_table: table })
+    if (canWriteErr) console.error("admin-write: admin_can_write RPC failed", { table, pg_code: canWriteErr.code, pg_message: canWriteErr.message, pg_details: canWriteErr.details, pg_hint: canWriteErr.hint })
     if (canWriteErr || canWrite !== true) return fail("KITPAT_INSUFFICIENT_ROLE", 403)
 
     if ((op === "update" || op === "delete") && !id) return fail("KITPAT_ID_REQUIRED", 400)
@@ -127,10 +153,7 @@ serve(async (req) => {
       // id is guaranteed non-null here: the update/delete branch above
       // already rejected a missing id with KITPAT_ID_REQUIRED.
       const { data, error } = await sbService.from(table).select("*").eq(pkCol, id as string).maybeSingle()
-      if (error) {
-        console.error("admin-write: before-read failed", { table, op, id, error })
-        return fail("KITPAT_WRITE_FAILED", 500)
-      }
+      if (error) return failDb("before-read failed", "KITPAT_WRITE_FAILED", 500, error, table, "select")
       if (!data) return fail("KITPAT_NOT_FOUND", 404)
       beforeRow = data
     }
@@ -138,24 +161,15 @@ serve(async (req) => {
     let afterRow: Record<string, unknown> | null = null
     if (op === "insert") {
       const { data, error } = await sbService.from(table).insert(payload as Record<string, unknown>).select().single()
-      if (error) {
-        console.error("admin-write: insert failed", { table, error })
-        return fail("KITPAT_WRITE_FAILED", 500)
-      }
+      if (error) return failDb("insert failed", "KITPAT_WRITE_FAILED", 500, error, table, "insert", payload as Record<string, unknown>)
       afterRow = data
     } else if (op === "update") {
       const { data, error } = await sbService.from(table).update(payload as Record<string, unknown>).eq(pkCol, id as string).select().single()
-      if (error) {
-        console.error("admin-write: update failed", { table, id, error })
-        return fail("KITPAT_WRITE_FAILED", 500)
-      }
+      if (error) return failDb("update failed", "KITPAT_WRITE_FAILED", 500, error, table, "update", payload as Record<string, unknown>)
       afterRow = data
     } else {
       const { error } = await sbService.from(table).delete().eq(pkCol, id as string)
-      if (error) {
-        console.error("admin-write: delete failed", { table, id, error })
-        return fail("KITPAT_WRITE_FAILED", 500)
-      }
+      if (error) return failDb("delete failed", "KITPAT_WRITE_FAILED", 500, error, table, "delete")
       afterRow = null // nothing exists post-delete; `before` already captured the final state
     }
 
@@ -176,7 +190,12 @@ serve(async (req) => {
     // The content write already succeeded -- a logging hiccup shouldn't
     // leave the admin unsure whether their edit saved. Surface it in
     // server logs only.
-    if (logErr) console.error("admin-write: log_admin_action failed", { table, op, resolvedId, logErr })
+    if (logErr) {
+      console.error("admin-write: log_admin_action failed", {
+        table, op, resolvedId,
+        pg_code: logErr.code, pg_message: logErr.message, pg_details: logErr.details, pg_hint: logErr.hint,
+      })
+    }
 
     return json({ ok: true, table, op, id: resolvedId, before: beforeRow, after: afterRow })
   } catch (e) {
