@@ -62,10 +62,32 @@ const RPC_ERROR_STATUS: Record<string, number> = {
   KITPAT_REVEAL_CODE_INVALID: 400,
 }
 
-function rpcFailure(message: string | undefined) {
-  const code = (message || "").trim()
+type PgErrorLike = { code?: string | null; message?: string | null; details?: string | null; hint?: string | null } | null | undefined
+
+/**
+ * AP17: logs the FULL Postgres/RPC error server-side (code/message/
+ * details/hint) via console.error, regardless of whether the message is a
+ * recognized KITPAT_* business code or a genuinely unexpected failure --
+ * every RPC failure path goes through here now, so none can go unlogged.
+ * A recognized code is returned to the client as-is (it's already
+ * self-diagnosing, e.g. KITPAT_REVEAL_CODE_EXPIRED). An UNRECOGNIZED
+ * message collapses to KITPAT_INTERNAL_ERROR, same as before, but now
+ * carries the 5-character SQLSTATE alongside it -- never message/details/
+ * hint, which can contain row values -- turning what used to be an opaque
+ * 500 into an instant diagnosis, exactly like admin-write's KITPAT_WRITE_
+ * FAILED / pg_code.
+ */
+function rpcFailure(rpcName: string, error: PgErrorLike) {
+  const code = (error?.message || "").trim()
+  console.error(`admin-reveal: ${rpcName} failed`, {
+    pg_code: error?.code ?? null,
+    pg_message: error?.message ?? null,
+    pg_details: error?.details ?? null,
+    pg_hint: error?.hint ?? null,
+  })
   const status = RPC_ERROR_STATUS[code]
-  return status ? fail(code, status) : fail("KITPAT_INTERNAL_ERROR", 500)
+  if (status) return fail(code, status)
+  return json({ error: "KITPAT_INTERNAL_ERROR", pg_code: error?.code ?? null }, 500)
 }
 
 type RequestStep = { step: "request"; user_id: string; field: "phone" | "email" }
@@ -95,6 +117,7 @@ serve(async (req) => {
       .select("id, role, is_active")
       .eq("email", user.email)
       .maybeSingle()
+    if (adminErr) console.error("admin-reveal: admins lookup failed", { pg_code: adminErr.code, pg_message: adminErr.message, pg_details: adminErr.details, pg_hint: adminErr.hint })
     if (adminErr || !adminRow || !adminRow.is_active || adminRow.role !== "owner") {
       return fail("KITPAT_INSUFFICIENT_ROLE", 403)
     }
@@ -123,7 +146,7 @@ serve(async (req) => {
         p_user_id: userId,
         p_field: field,
       } satisfies { p_user_id: string; p_field: string })
-      if (error || !data) return rpcFailure(error?.message)
+      if (error || !data) return rpcFailure("admin_request_reveal", error)
 
       const { request_id, expires_in, code } = data as { request_id: string; expires_in: number; code: string }
 
@@ -165,7 +188,7 @@ serve(async (req) => {
         p_request_id: requestId,
         p_code: code,
       } satisfies { p_request_id: string; p_code: string })
-      if (error || !data) return rpcFailure(error?.message)
+      if (error || !data) return rpcFailure("admin_confirm_reveal", error)
 
       const { field, value } = data as { field: string; value: string }
       return json({ ok: true, field, value })
